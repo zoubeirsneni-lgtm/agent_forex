@@ -1,14 +1,10 @@
 import { X } from 'lucide-react';
 
 export type MarketSourceMode = 'live' | 'mt5_bridge' | 'mt5_offline';
-export type LlmTestMode = 'real' | 'test_confirme' | 'test_refuse' | 'test_429';
 
 export interface DashboardSettings {
   marketSource: MarketSourceMode;
   mt5BridgeUrl: string;
-  llmRouterUrl: string;
-  llmApiKey: string;
-  llmTestMode: LlmTestMode;
 }
 
 interface SettingsModalProps {
@@ -73,48 +69,6 @@ export function SettingsModal({ open, settings, onChange, onClose }: SettingsMod
               />
             </div>
           )}
-
-          <div>
-            <label className="mb-2 block text-xs font-semibold text-slate-300">
-              Endpoint Routeur LLM local
-            </label>
-            <input
-              type="text"
-              value={settings.llmRouterUrl}
-              onChange={(e) => onChange({ ...settings, llmRouterUrl: e.target.value })}
-              className="w-full rounded-lg border border-[#1e2633] bg-[#07090d] px-3 py-2 font-mono text-sm text-slate-100 focus:border-emerald-500 focus:outline-none"
-            />
-          </div>
-
-          <div>
-            <label className="mb-2 block text-xs font-semibold text-slate-300">
-              Clé API Routeur LLM
-            </label>
-            <input
-              type="password"
-              value={settings.llmApiKey}
-              onChange={(e) => onChange({ ...settings, llmApiKey: e.target.value })}
-              className="w-full rounded-lg border border-[#1e2633] bg-[#07090d] px-3 py-2 font-mono text-sm text-slate-100 focus:border-emerald-500 focus:outline-none"
-            />
-          </div>
-
-          <div>
-            <label className="mb-2 block text-xs font-semibold text-slate-300">
-              Comportement validation LLM (EURUSDm 1m/3m ≥ 6/8)
-            </label>
-            <select
-              value={settings.llmTestMode}
-              onChange={(e) =>
-                onChange({ ...settings, llmTestMode: e.target.value as LlmTestMode })
-              }
-              className="w-full rounded-lg border border-[#1e2633] bg-[#07090d] px-3 py-2.5 text-sm text-slate-100 focus:border-emerald-500 focus:outline-none"
-            >
-              <option value="real">Appel réel vers routeur LLM local</option>
-              <option value="test_confirme">Simuler verdict CONFIRMÉ (tester Popup Géant)</option>
-              <option value="test_refuse">Simuler verdict REFUSÉ</option>
-              <option value="test_429">Simuler erreur 429 (ERREUR LLM pendant 60s)</option>
-            </select>
-          </div>
         </div>
 
         <div className="flex justify-end border-t border-[#1e2633] bg-[#090c11] px-6 py-3.5">

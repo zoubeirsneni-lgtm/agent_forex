@@ -7,7 +7,6 @@ export type Timeframe = (typeof TIMEFRAMES)[number];
 export type PivotHtf = 'M15' | 'H1' | 'H4' | 'D1';
 export type Vote = 1 | -1;
 export type SignalDirection = 'ACHAT' | 'VENTE' | 'NEUTRE';
-export type LlmDecision = 'CONFIRME' | 'REFUSE' | 'NEUTRE';
 
 export interface Candle {
   time: number; // Unix seconds
@@ -202,12 +201,6 @@ export interface TimeframeAnalysis {
   confluenceLabel: string;
   indicators: IndicatorResult[];
 }
-
-export type LlmCellState =
-  | { kind: 'NON_REQUIS' }
-  | { kind: 'EN_COURS' }
-  | { kind: 'VERDICT'; decision: LlmDecision; confiance: number; raison: string; cachedUntil: number }
-  | { kind: 'ERREUR'; message: string; retryAfter: number };
 
 // --- Technical Indicator Math ---
 

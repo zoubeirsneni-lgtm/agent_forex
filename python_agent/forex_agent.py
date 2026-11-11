@@ -3,24 +3,21 @@
 """
 Forex Agent Dashboard - Agent autonome Windows 10 + MetaTrader 5 (Exness-MT5Trial16)
 Surveillance temps réel de 4 paires (EURUSDm, GBPUSDm, USDJPYm, AUDUSDm)
-sur 7 timeframes (15s, 30s, 1m, 3m, 5m, 10m, 15m) avec 8 indicateurs techniques
-et validation LLM restrictive via routeur local http://127.0.0.1:31415/v1/messages.
+sur 7 timeframes (15s, 30s, 1m, 3m, 5m, 10m, 15m) avec 8 indicateurs techniques.
 """
 
 import json
 import os
-import re
 import signal
 import sys
 import time
 import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import requests
 
 try:
     import MetaTrader5 as mt5
@@ -40,13 +37,7 @@ TIMEFRAMES = ["15s", "30s", "1m", "3m", "5m", "10m", "15m"]
 
 REFRESH_SECONDS = 15
 
-LLM_ENDPOINT = os.environ.get("LLM_ENDPOINT", "http://127.0.0.1:31415/v1/messages")
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "freellmapi-XXXXX")
-LLM_MODEL = os.environ.get("LLM_MODEL", "claude-3-5-sonnet-20241022")
-LLM_CACHE_TTL_SEC = 60
-LLM_429_COOLDOWN_SEC = 60
-
-# Paramètres stricts par zone (CRUCIAL)
+# Paramètres stricts par zone
 ZONES: Dict[str, Dict[str, Any]] = {
     "15s": {
         "zone": 1,
@@ -197,8 +188,7 @@ def fetch_mt5_rates(symbol: str, tf_code: int, count: int = 150) -> Optional[pd.
     rates = mt5.copy_rates_from_pos(symbol, tf_code, 0, count)
     if rates is None or len(rates) < 30:
         return None
-    df = pd.DataFrame(rates)
-    return df
+    return pd.DataFrame(rates)
 
 
 def fetch_pivot_htf_candle(symbol: str, pivot_htf: str) -> Optional[Dict[str, float]]:
@@ -365,157 +355,10 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
 
 
 # ==============================================================================
-# GESTIONNAIRE LLM RESTRICTIF
-# ==============================================================================
-class RestrictiveLlmManager:
-    def __init__(self):
-        # Clé (pair, tf) -> dict
-        self.cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        self.last_signal_called: Dict[Tuple[str, str], str] = {}
-        self.cooldown_until: float = 0.0
-
-    def evaluate_cycle(self, results: Dict[str, Dict[str, Optional[Dict[str, Any]]]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
-        """
-        Règles strictes :
-        - UNIQUEMENT EURUSDm
-        - UNIQUEMENT 1m et 3m
-        - UNIQUEMENT confluence >= 6/8
-        - UNIQUEMENT si le signal a changé depuis le dernier appel réussi
-        - MAXIMUM 1 appel LLM par cycle de 15s
-        - Cache verdict 60s minimum
-        - Si 429 : afficher ERREUR LLM pendant 60s sans réessayer
-        """
-        now = time.time()
-        verdicts: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        call_made_this_cycle = False
-
-        for pair in PAIRS:
-            for tf in TIMEFRAMES:
-                row = results.get(pair, {}).get(tf)
-                if row is None:
-                    verdicts[(pair, tf)] = {"state": "WAIT", "label": "WAIT"}
-                    continue
-
-                if pair != "EURUSDm" or tf not in ("1m", "3m") or row["confluence"] < 6:
-                    verdicts[(pair, tf)] = {"state": "NON_REQUIS", "label": "NON_REQUIS"}
-                    continue
-
-                key = (pair, tf)
-                cached = self.cache.get(key)
-                sig = row["signal_label"]
-
-                # Vérifier cache valide (60s minimum) et signal inchangé
-                if cached and now < cached["expires_at"]:
-                    verdicts[key] = cached["verdict"]
-                    continue
-
-                if self.last_signal_called.get(key) == sig and cached:
-                    verdicts[key] = cached["verdict"]
-                    continue
-
-                # Rate limit 429 actif ?
-                if now < self.cooldown_until:
-                    verdicts[key] = {"state": "ERREUR", "label": "ERREUR LLM"}
-                    continue
-
-                # Max 1 appel par cycle de 15s
-                if call_made_this_cycle:
-                    if cached:
-                        verdicts[key] = cached["verdict"]
-                    else:
-                        verdicts[key] = {"state": "EN_COURS", "label": "EN COURS..."}
-                    continue
-
-                call_made_this_cycle = True
-                verdict, is_429, ok = self._call_llm(row)
-                if is_429:
-                    self.cooldown_until = now + LLM_429_COOLDOWN_SEC
-                    verdicts[key] = {"state": "ERREUR", "label": "ERREUR LLM"}
-                elif not ok:
-                    verdicts[key] = {"state": "ERREUR", "label": "ERREUR LLM"}
-                else:
-                    self.last_signal_called[key] = sig
-                    self.cache[key] = {
-                        "expires_at": now + LLM_CACHE_TTL_SEC,
-                        "verdict": verdict,
-                    }
-                    verdicts[key] = verdict
-
-        return verdicts
-
-    def _call_llm(self, row: Dict[str, Any]) -> Tuple[Dict[str, Any], bool, bool]:
-        prompt = (
-            f"Analyse ce signal Forex pour validation stricte.\n"
-            f"Paire: {row['pair']}\n"
-            f"Timeframe: {row['timeframe']}\n"
-            f"Signal agent: {row['signal_label']}\n"
-            f"Confluence: {row['confluence_label']}\n"
-            f"Réponds UNIQUEMENT en JSON strict sur une ligne : "
-            f'{{"decision":"CONFIRME"|"REFUSE"|"NEUTRE","raison":"court","confiance":0-100}}'
-        )
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": LLM_API_KEY,
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "anthropic-version": "2023-06-01",
-        }
-        payload = {
-            "model": LLM_MODEL,
-            "max_tokens": 120,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        try:
-            resp = requests.post(LLM_ENDPOINT, headers=headers, json=payload, timeout=8)
-            if resp.status_code == 429:
-                print("[LLM] Erreur 429 (rate limit) -> pause de 60s.")
-                return {}, True, False
-            if resp.status_code >= 400:
-                print(f"[LLM] Erreur HTTP {resp.status_code}")
-                return {}, False, False
-
-            data = resp.json()
-            # Extraction compatible Anthropic / OpenAI-like
-            text = ""
-            if isinstance(data.get("content"), list) and data["content"]:
-                text = data["content"][0].get("text", "")
-            elif isinstance(data.get("choices"), list) and data["choices"]:
-                text = data["choices"][0].get("message", {}).get("content", "")
-            else:
-                text = json.dumps(data)
-
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if not match:
-                return {}, False, False
-            parsed = json.loads(match.group(0))
-            decision = str(parsed.get("decision", "NEUTRE")).upper()
-            if decision not in ("CONFIRME", "REFUSE", "NEUTRE"):
-                decision = "NEUTRE"
-            confiance = max(0, min(100, int(parsed.get("confiance", 50))))
-
-            if decision == "CONFIRME":
-                label = f"CONFIRMÉ {confiance}%"
-            elif decision == "REFUSE":
-                label = f"REFUSÉ {confiance}%"
-            else:
-                label = f"NEUTRE {confiance}%"
-
-            return {
-                "state": decision,
-                "decision": decision,
-                "confiance": confiance,
-                "label": label,
-            }, False, True
-        except Exception as exc:
-            print(f"[LLM] Routeur inaccessible : {exc}")
-            return {}, False, False
-
-
-# ==============================================================================
 # GÉNÉRATION HTML AUTONOME (dashboard/forex_dashboard.html)
 # ==============================================================================
 def render_dashboard_html(
     results: Dict[str, Dict[str, Optional[Dict[str, Any]]]],
-    verdicts: Dict[Tuple[str, str], Dict[str, Any]],
     mt5_ok: bool,
     updated_at: str,
 ) -> str:
@@ -524,7 +367,6 @@ def render_dashboard_html(
         rows = []
         for tf in TIMEFRAMES:
             row = results.get(pair, {}).get(tf)
-            v = verdicts.get((pair, tf), {"state": "NON_REQUIS", "label": "NON_REQUIS"})
             if not mt5_ok or row is None:
                 rows.append({
                     "pair": pair,
@@ -532,8 +374,6 @@ def render_dashboard_html(
                     "direction": "WAIT",
                     "signal_label": "WAIT",
                     "confluence_label": "WAIT",
-                    "llm_state": "WAIT",
-                    "llm_label": "WAIT",
                 })
             else:
                 rows.append({
@@ -542,8 +382,6 @@ def render_dashboard_html(
                     "direction": row["direction"],
                     "signal_label": row["signal_label"],
                     "confluence_label": row["confluence_label"],
-                    "llm_state": v["state"],
-                    "llm_label": v["label"],
                 })
         payload[pair] = rows
 
@@ -607,53 +445,7 @@ def render_dashboard_html(
     .sig-NEUTRE {{ background: #334155; color: #e2e8f0; }}
     .sig-WAIT {{ background: #1e293b; color: #fbbf24; }}
     .conf-cell {{ font-family: Consolas, monospace; font-size: 22px; font-weight: 700; color: #f8fafc; }}
-    .llm-badge {{
-      display: inline-block; padding: 8px 14px; border-radius: 8px;
-      font-family: Consolas, monospace; font-size: 14px; font-weight: 700;
-    }}
-    .llm-CONFIRME {{ background: #059669; color: #ffffff; }}
-    .llm-REFUSE {{ background: #dc2626; color: #ffffff; }}
-    .llm-NEUTRE {{ background: #ca8a04; color: #ffffff; }}
-    .llm-NON_REQUIS {{ background: #334155; color: #cbd5e1; }}
-    .llm-EN_COURS {{ background: #475569; color: #f8fafc; animation: pulse 1s infinite; }}
-    .llm-ERREUR {{ background: #1f2937; color: #f87171; border: 1px solid #374151; }}
-    .llm-WAIT {{ background: #1e293b; color: #fbbf24; }}
-    @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.45; }} }}
     .footer {{ margin-top: 16px; color: #94a3b8; font-size: 14px; font-family: Consolas, monospace; }}
-
-    /* POPUP GÉANT (5x plus grand) */
-    .popup-overlay {{
-      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.86);
-      display: none; align-items: center; justify-content: center;
-      z-index: 9999; padding: 24px;
-    }}
-    .popup-overlay.visible {{ display: flex; }}
-    .popup-card {{
-      position: relative; width: 100%; max-width: 960px;
-      background: #0b0f17; border-radius: 28px;
-      padding: 56px 48px; text-align: center;
-      border: 8px solid #10b981;
-      box-shadow: 0 25px 80px rgba(0, 0, 0, 0.85);
-    }}
-    .popup-card.vente {{ border-color: #ef4444; }}
-    .popup-close {{
-      position: absolute; top: 22px; right: 26px;
-      width: 56px; height: 56px; border-radius: 14px;
-      background: #1e293b; color: #ffffff; border: 1px solid #334155;
-      font-size: 28px; font-weight: 800; cursor: pointer;
-    }}
-    .popup-title {{ font-size: 42px; font-weight: 800; margin-bottom: 28px; }}
-    .popup-pair {{ font-size: 64px; font-weight: 800; font-family: Consolas, monospace; margin-bottom: 14px; }}
-    .popup-tf {{ font-size: 36px; font-weight: 700; color: #cbd5e1; margin-bottom: 24px; }}
-    .popup-signal {{ font-size: 56px; font-weight: 800; font-family: Consolas, monospace; margin-bottom: 18px; }}
-    .popup-signal.achat {{ color: #34d399; }}
-    .popup-signal.vente {{ color: #f87171; }}
-    .popup-conf {{ font-size: 38px; font-weight: 700; margin-bottom: 24px; font-family: Consolas, monospace; }}
-    .popup-llm {{
-      display: inline-block; padding: 16px 36px; border-radius: 16px;
-      font-size: 36px; font-weight: 800; font-family: Consolas, monospace;
-      background: #059669; color: #ffffff;
-    }}
   </style>
 </head>
 <body>
@@ -667,7 +459,6 @@ def render_dashboard_html(
             <th>Timeframe</th>
             <th>Signal</th>
             <th>Confluence</th>
-            <th>Verdict LLM</th>
           </tr>
         </thead>
         <tbody id="tableBody"></tbody>
@@ -676,40 +467,14 @@ def render_dashboard_html(
     <div class="footer" id="footerTime"></div>
   </div>
 
-  <div class="popup-overlay" id="giantPopup">
-    <div class="popup-card" id="popupCard">
-      <button class="popup-close" id="popupCloseBtn" aria-label="Fermer">✕</button>
-      <div class="popup-title">🔔 SIGNAL CONFIRMÉ</div>
-      <div class="popup-pair" id="popupPair"></div>
-      <div class="popup-tf" id="popupTf"></div>
-      <div class="popup-signal" id="popupSignal"></div>
-      <div class="popup-conf" id="popupConf"></div>
-      <div class="popup-llm" id="popupLlm"></div>
-    </div>
-  </div>
-
   <script>
     const DATA = {data_json};
     const UPDATED_AT = {updated_json};
     const PAIRS = ["EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm"];
     const STORAGE_PAIR = "forex_agent_selected_pair";
-    const STORAGE_DISMISSED = "forex_agent_dismissed_signatures";
 
     let selectedPair = localStorage.getItem(STORAGE_PAIR);
     if (!PAIRS.includes(selectedPair)) selectedPair = "EURUSDm";
-
-    function getDismissed() {{
-      try {{ return JSON.parse(localStorage.getItem(STORAGE_DISMISSED) || "[]"); }}
-      catch {{ return []; }}
-    }}
-
-    function dismissSignature(sig) {{
-      const list = getDismissed();
-      if (!list.includes(sig)) {{
-        list.push(sig);
-        localStorage.setItem(STORAGE_DISMISSED, JSON.stringify(list.slice(-50)));
-      }}
-    }}
 
     function renderPairs() {{
       const wrap = document.getElementById("pairSelector");
@@ -727,7 +492,6 @@ def render_dashboard_html(
           localStorage.setItem(STORAGE_PAIR, p);
           renderPairs();
           renderTable();
-          renderPopup();
         }});
         lbl.appendChild(inp);
         lbl.appendChild(document.createTextNode(p));
@@ -755,62 +519,16 @@ def render_dashboard_html(
         tdConf.className = "conf-cell";
         tdConf.textContent = r.confluence_label;
 
-        const tdLlm = document.createElement("td");
-        const llmSpan = document.createElement("span");
-        llmSpan.className = "llm-badge llm-" + r.llm_state;
-        llmSpan.textContent = r.llm_label;
-        tdLlm.appendChild(llmSpan);
-
         tr.appendChild(tdTf);
         tr.appendChild(tdSig);
         tr.appendChild(tdConf);
-        tr.appendChild(tdLlm);
         tbody.appendChild(tr);
       }});
       document.getElementById("footerTime").textContent = "Dernière mise à jour : " + UPDATED_AT;
     }}
 
-    let activePopupSig = null;
-    function renderPopup() {{
-      const overlay = document.getElementById("giantPopup");
-      const rows = DATA[selectedPair] || [];
-      const dismissed = getDismissed();
-      const match = rows.find(r =>
-        r.pair === selectedPair &&
-        (r.timeframe === "1m" || r.timeframe === "3m") &&
-        r.llm_state === "CONFIRME" &&
-        !dismissed.includes(r.pair + "|" + r.timeframe + "|" + r.signal_label + "|CONFIRME")
-      );
-
-      if (!match) {{
-        activePopupSig = null;
-        overlay.classList.remove("visible");
-        return;
-      }}
-
-      activePopupSig = match.pair + "|" + match.timeframe + "|" + match.signal_label + "|CONFIRME";
-      const card = document.getElementById("popupCard");
-      card.className = "popup-card " + (match.direction === "VENTE" ? "vente" : "achat");
-      document.getElementById("popupPair").textContent = match.pair;
-      document.getElementById("popupTf").textContent = "Timeframe : " + match.timeframe;
-      const sigEl = document.getElementById("popupSignal");
-      sigEl.textContent = match.signal_label;
-      sigEl.className = "popup-signal " + (match.direction === "VENTE" ? "vente" : "achat");
-      document.getElementById("popupConf").textContent = "Confluence : " + match.confluence_label;
-      document.getElementById("popupLlm").textContent = match.llm_label;
-      overlay.classList.add("visible");
-    }}
-
-    document.getElementById("popupCloseBtn").addEventListener("click", () => {{
-      if (activePopupSig) {{
-        dismissSignature(activePopupSig);
-      }}
-      document.getElementById("giantPopup").classList.remove("visible");
-    }});
-
     renderPairs();
     renderTable();
-    renderPopup();
   </script>
 </body>
 </html>
@@ -846,7 +564,6 @@ def main() -> None:
 
     sync_to_second_59()
 
-    llm_manager = RestrictiveLlmManager()
     browser_opened = False
 
     while RUNNING:
@@ -866,9 +583,8 @@ def main() -> None:
         else:
             print("[AVERTISSEMENT] MetaTrader 5 injoignable -> affichage WAIT partout.")
 
-        verdicts = llm_manager.evaluate_cycle(results)
         updated_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        html = render_dashboard_html(results, verdicts, mt5_ok, updated_str)
+        html = render_dashboard_html(results, mt5_ok, updated_str)
         write_dashboard_atomically(html)
 
         if not browser_opened:

@@ -1,5 +1,6 @@
 import express from 'express';
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
@@ -16,7 +17,7 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 const YAHOO_SYMBOL: Record<ForexPair, string> = {
   EURUSDm: 'EURUSD=X',
@@ -256,6 +257,7 @@ async function advancePairMarket(pair: ForexPair): Promise<void> {
 
 async function startServer() {
   const app = express();
+  const httpServer = http.createServer(app);
   app.use(express.json({ limit: '1mb' }));
 
   // 1. Snapshot de marché multi-paires / multi-timeframes
@@ -333,120 +335,7 @@ async function startServer() {
     });
   });
 
-  // 2. Proxy routeur LLM local (http://127.0.0.1:31415/v1/messages)
-  app.post('/api/llm-verdict', async (req, res) => {
-    const {
-      pair,
-      timeframe,
-      signalLabel,
-      confluenceLabel,
-      indicators,
-      routerUrl = 'http://127.0.0.1:31415/v1/messages',
-      apiKey = 'freellmapi-XXXXX',
-      testMode = 'real',
-    } = req.body || {};
-
-    if (pair !== 'EURUSDm' || (timeframe !== '1m' && timeframe !== '3m')) {
-      res.status(400).json({ ok: false, error: 'Hors périmètre LLM restrictif (EURUSDm 1m/3m uniquement).' });
-      return;
-    }
-
-    // Modes de test explicites pour validation UI si sélectionnés dans Paramètres
-    if (testMode === 'test_429') {
-      res.status(429).json({ ok: false, rateLimited: true, error: 'ERREUR LLM (429)' });
-      return;
-    }
-    if (testMode === 'test_confirme') {
-      res.json({
-        ok: true,
-        decision: 'CONFIRME',
-        raison: 'Confluence multi-indicateurs cohérente',
-        confiance: 87,
-      });
-      return;
-    }
-    if (testMode === 'test_refuse') {
-      res.json({
-        ok: true,
-        decision: 'REFUSE',
-        raison: 'Divergence court terme détectée',
-        confiance: 72,
-      });
-      return;
-    }
-
-    const prompt = [
-      'Tu es un validateur quantitatif Forex. Analyse ce signal et réponds STRICTEMENT en JSON valide.',
-      `Paire: ${pair}`,
-      `Timeframe: ${timeframe}`,
-      `Signal agent: ${signalLabel}`,
-      `Confluence: ${confluenceLabel}`,
-      `Indicateurs: ${JSON.stringify(indicators || [])}`,
-      'Format JSON obligatoire (aucun autre texte): {"decision":"CONFIRME"|"REFUSE"|"NEUTRE","raison":"court","confiance":0-100}',
-    ].join('\n');
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 7000);
-    try {
-      const upstream = await fetch(String(routerUrl), {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': String(apiKey),
-          Authorization: `Bearer ${String(apiKey)}`,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-3-5-sonnet-20241022',
-          max_tokens: 140,
-          messages: [{ role: 'user', content: prompt }],
-        }),
-      });
-
-      if (upstream.status === 429) {
-        res.status(429).json({ ok: false, rateLimited: true, error: 'ERREUR LLM' });
-        return;
-      }
-
-      if (!upstream.ok) {
-        res.status(502).json({ ok: false, rateLimited: false, error: 'ERREUR LLM' });
-        return;
-      }
-
-      const data: any = await upstream.json();
-      let rawText = '';
-      if (Array.isArray(data?.content) && data.content[0]?.text) {
-        rawText = String(data.content[0].text);
-      } else if (Array.isArray(data?.choices) && data.choices[0]?.message?.content) {
-        rawText = String(data.choices[0].message.content);
-      } else {
-        rawText = JSON.stringify(data);
-      }
-
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        res.status(502).json({ ok: false, rateLimited: false, error: 'ERREUR LLM' });
-        return;
-      }
-
-      const parsed = JSON.parse(jsonMatch[0]);
-      const rawDecision = String(parsed.decision || 'NEUTRE').toUpperCase();
-      const decision = rawDecision === 'CONFIRME' || rawDecision === 'REFUSE' || rawDecision === 'NEUTRE'
-        ? rawDecision
-        : 'NEUTRE';
-      const confiance = Math.max(0, Math.min(100, Math.round(Number(parsed.confiance ?? 50))));
-      const raison = String(parsed.raison || 'Analyse complétée').slice(0, 80);
-
-      res.json({ ok: true, decision, raison, confiance });
-    } catch {
-      res.status(503).json({ ok: false, rateLimited: false, error: 'ERREUR LLM' });
-    } finally {
-      clearTimeout(timer);
-    }
-  });
-
-  // 3. Export des scripts Windows 10 / MetaTrader 5
+  // 2. Export des scripts Windows 10 / MetaTrader 5
   app.get('/api/python-agent', (_req, res) => {
     try {
       const pyDir = path.join(__dirname, 'python_agent');
@@ -468,7 +357,10 @@ async function startServer() {
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -480,13 +372,13 @@ async function startServer() {
     });
   }
 
-  const server = app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[Forex Agent Dashboard] Serveur actif sur http://0.0.0.0:${PORT}`);
   });
 
   const shutdown = () => {
     console.log('\n[ARRET] Fermeture propre du serveur Forex Agent Dashboard...');
-    server.close(() => process.exit(0));
+    httpServer.close(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
