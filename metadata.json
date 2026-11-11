@@ -1,0 +1,6 @@
+{
+  "name": "Forex Agent Dashboard",
+  "description": "Dashboard de surveillance du marché forex en temps réel de type Quotex avec 8 indicateurs techniques sur 7 timeframes et validation LLM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
