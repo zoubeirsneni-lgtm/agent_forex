@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Code2, RefreshCw, Settings } from 'lucide-react';
 import {
   type ForexPair,
@@ -12,7 +12,6 @@ import { PythonExportModal } from './components/PythonExportModal';
 import { type DashboardSettings, SettingsModal } from './components/SettingsModal';
 
 const STORAGE_PAIR_KEY = 'forex_agent_selected_pair';
-const REFRESH_SECONDS = 15;
 
 function readInitialPair(): ForexPair {
   try {
@@ -26,12 +25,74 @@ function readInitialPair(): ForexPair {
   return 'EURUSDm';
 }
 
-function formatTimeHHMMSS(date: Date): string {
-  return date.toLocaleTimeString('fr-FR', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
+function getNextTargetEpochSec(tf: Timeframe, afterEpochSec: number): number {
+  const base = new Date(afterEpochSec * 1000);
+  const year = base.getFullYear();
+  const month = base.getMonth();
+  const day = base.getDate();
+  const hour = base.getHours();
+  const minute = base.getMinutes();
+
+  if (tf === '30s') {
+    const t25 = Math.floor(new Date(year, month, day, hour, minute, 25, 0).getTime() / 1000);
+    if (t25 > afterEpochSec) return t25;
+    const t55 = Math.floor(new Date(year, month, day, hour, minute, 55, 0).getTime() / 1000);
+    if (t55 > afterEpochSec) return t55;
+    return Math.floor(new Date(year, month, day, hour, minute + 1, 25, 0).getTime() / 1000);
+  }
+
+  if (tf === '1m' || tf === '3m' || tf === '5m') {
+    const t55 = Math.floor(new Date(year, month, day, hour, minute, 55, 0).getTime() / 1000);
+    if (t55 > afterEpochSec) return t55;
+    return Math.floor(new Date(year, month, day, hour, minute + 1, 55, 0).getTime() / 1000);
+  }
+
+  if (tf === '10m') {
+    for (let offset = 0; offset <= 2; offset++) {
+      const candDate = new Date(year, month, day, hour, minute + offset, 55, 0);
+      const candSec = Math.floor(candDate.getTime() / 1000);
+      if (candDate.getMinutes() % 2 === 1 && candSec > afterEpochSec) {
+        return candSec;
+      }
+    }
+  }
+
+  // 15m : :55 des minutes 02, 05, 08, 11, 14, 17, 20... (minute % 3 === 2)
+  for (let offset = 0; offset <= 3; offset++) {
+    const candDate = new Date(year, month, day, hour, minute + offset, 55, 0);
+    const candSec = Math.floor(candDate.getTime() / 1000);
+    if (candDate.getMinutes() % 3 === 2 && candSec > afterEpochSec) {
+      return candSec;
+    }
+  }
+
+  return afterEpochSec + 180;
+}
+
+function buildInitialTargets(nowEpochSec: number): Record<Timeframe, number> {
+  const targets = {} as Record<Timeframe, number>;
+  for (const tf of TIMEFRAMES) {
+    targets[tf] = getNextTargetEpochSec(tf, nowEpochSec);
+  }
+  return targets;
+}
+
+function computeRemainingByTf(
+  targets: Record<Timeframe, number>,
+  nowEpochSec: number
+): Record<Timeframe, number> {
+  const result = {} as Record<Timeframe, number>;
+  for (const tf of TIMEFRAMES) {
+    result[tf] = Math.max(0, targets[tf] - nowEpochSec);
+  }
+  return result;
+}
+
+function formatMmSs(totalSeconds: number): string {
+  const clamped = Math.max(0, Math.floor(totalSeconds));
+  const mm = String(Math.floor(clamped / 60)).padStart(2, '0');
+  const ss = String(clamped % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
 }
 
 export default function App() {
@@ -40,23 +101,15 @@ export default function App() {
 
   const [analysisByPair, setAnalysisByPair] = useState<Record<ForexPair, TimeframeAnalysis[]> | null>(null);
   const [mt5WaitMode, setMt5WaitMode] = useState<boolean>(false);
-  const [lastUpdated, setLastUpdated] = useState<string>('En attente de synchronisation...');
+  const [lastUpdated, setLastUpdated] = useState<string>('Chargement...');
 
-  // Synchronisation au démarrage à la 59e seconde
-  const [isSynced, setIsSynced] = useState<boolean>(() => new Date().getSeconds() === 59);
-  const [syncWaitRemaining, setSyncWaitRemaining] = useState<number>(() => {
-    const s = new Date().getSeconds();
-    return s === 59 ? 0 : 59 - s;
-  });
-  const [syncTargetStr, setSyncTargetStr] = useState<string>(() => {
-    const now = new Date();
-    const wait = now.getSeconds() === 59 ? 0 : 59 - now.getSeconds();
-    return formatTimeHHMMSS(new Date(now.getTime() + wait * 1000));
-  });
+  const initialEpochSec = Math.floor(Date.now() / 1000);
+  const targetsRef = useRef<Record<Timeframe, number>>(buildInitialTargets(initialEpochSec));
+  const [remainingByTf, setRemainingByTf] = useState<Record<Timeframe, number>>(() =>
+    computeRemainingByTf(targetsRef.current, initialEpochSec)
+  );
 
-  const [nextRefreshIn, setNextRefreshIn] = useState<number>(REFRESH_SECONDS);
   const [isFetching, setIsFetching] = useState<boolean>(false);
-
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
   const [pythonModalOpen, setPythonModalOpen] = useState<boolean>(false);
   const [settings, setSettings] = useState<DashboardSettings>({
@@ -74,70 +127,87 @@ export default function App() {
     }
   };
 
-  const runCycle = useCallback(async () => {
-    setIsFetching(true);
-    try {
-      const params = new URLSearchParams({
-        source: settings.marketSource,
-        bridgeUrl: settings.mt5BridgeUrl,
-      });
-      const res = await fetch(`/api/market-snapshot?${params.toString()}`);
-      const data = await res.json();
+  const fetchTimeframes = useCallback(
+    async (tfs: readonly Timeframe[], showSpinner: boolean) => {
+      if (showSpinner) setIsFetching(true);
+      try {
+        const params = new URLSearchParams({
+          source: settings.marketSource,
+          bridgeUrl: settings.mt5BridgeUrl,
+          tfs: tfs.join(','),
+        });
+        const res = await fetch(`/api/market-snapshot?${params.toString()}`);
+        const data = await res.json();
 
-      if (!data?.ok) {
+        if (!data?.ok) {
+          setMt5WaitMode(true);
+          setLastUpdated(data?.updatedAt || new Date().toLocaleString('fr-FR'));
+          return;
+        }
+
+        setMt5WaitMode(false);
+        const incoming = data.analysisByPair as Record<ForexPair, TimeframeAnalysis[]>;
+        setAnalysisByPair((prev) => {
+          if (!prev) return incoming;
+          const next = { ...prev };
+          for (const pair of PAIRS) {
+            const existingRows = prev[pair] || [];
+            const incomingRows = incoming[pair] || [];
+            const incomingMap = new Map(incomingRows.map((r) => [r.timeframe, r]));
+            const existingMap = new Map(existingRows.map((r) => [r.timeframe, r]));
+            next[pair] = TIMEFRAMES.map((tf) => incomingMap.get(tf) || existingMap.get(tf)).filter(
+              (r): r is TimeframeAnalysis => Boolean(r)
+            );
+          }
+          return next;
+        });
+        setLastUpdated(data.updatedAt);
+      } catch {
         setMt5WaitMode(true);
-        setLastUpdated(data?.updatedAt || new Date().toLocaleString('fr-FR'));
-        return;
+        setLastUpdated(new Date().toLocaleString('fr-FR'));
+      } finally {
+        if (showSpinner) setIsFetching(false);
+      }
+    },
+    [settings.marketSource, settings.mt5BridgeUrl]
+  );
+
+  // Chargement initial complet des 6 timeframes au démarrage ou changement de source
+  useEffect(() => {
+    fetchTimeframes(TIMEFRAMES, true);
+  }, [fetchTimeframes]);
+
+  // Horloge temps réel par ligne : compte à rebours indépendant et recalcul exact aux moments prévus
+  useEffect(() => {
+    let lastCheckedSec = Math.floor(Date.now() / 1000);
+
+    const timer = window.setInterval(() => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (nowSec === lastCheckedSec) return;
+      lastCheckedSec = nowSec;
+
+      const dueTfs: Timeframe[] = [];
+      for (const tf of TIMEFRAMES) {
+        if (nowSec >= targetsRef.current[tf]) {
+          dueTfs.push(tf);
+          targetsRef.current[tf] = getNextTargetEpochSec(tf, nowSec);
+        }
       }
 
-      setMt5WaitMode(false);
-      setAnalysisByPair(data.analysisByPair);
-      setLastUpdated(data.updatedAt);
-    } catch {
-      setMt5WaitMode(true);
-      setLastUpdated(new Date().toLocaleString('fr-FR'));
-    } finally {
-      setIsFetching(false);
-      setNextRefreshIn(REFRESH_SECONDS);
-    }
-  }, [settings.marketSource, settings.mt5BridgeUrl]);
+      setRemainingByTf(computeRemainingByTf(targetsRef.current, nowSec));
 
-  // Phase 1 : Attente jusqu'à la 59e seconde de la minute en cours
-  useEffect(() => {
-    if (isSynced) return;
-    const timer = window.setInterval(() => {
-      const now = new Date();
-      const sec = now.getSeconds();
-      if (sec === 59) {
-        setSyncWaitRemaining(0);
-        setIsSynced(true);
-      } else {
-        const remaining = 59 - sec;
-        setSyncWaitRemaining(remaining);
-        setSyncTargetStr(formatTimeHHMMSS(new Date(now.getTime() + remaining * 1000)));
+      if (dueTfs.length > 0) {
+        fetchTimeframes(dueTfs, false);
       }
     }, 250);
+
     return () => window.clearInterval(timer);
-  }, [isSynced]);
+  }, [fetchTimeframes]);
 
-  // Phase 2 : Une fois synchronisé à :59, boucle toutes les 15 secondes
-  useEffect(() => {
-    if (!isSynced) return;
-    runCycle();
-    const interval = window.setInterval(() => {
-      runCycle();
-    }, REFRESH_SECONDS * 1000);
-    return () => window.clearInterval(interval);
-  }, [isSynced, runCycle]);
-
-  // Décompte visuel des 15 secondes
-  useEffect(() => {
-    if (!isSynced) return;
-    const tick = window.setInterval(() => {
-      setNextRefreshIn((prev) => (prev > 1 ? prev - 1 : REFRESH_SECONDS));
-    }, 1000);
-    return () => window.clearInterval(tick);
-  }, [isSynced]);
+  // Bouton Actualiser : recalcule immédiatement les 6 timeframes sans toucher aux comptes à rebours
+  const handleManualRefresh = () => {
+    fetchTimeframes(TIMEFRAMES, true);
+  };
 
   // Lignes du tableau pour la paire sélectionnée uniquement
   const currentRows: TimeframeAnalysis[] = useMemo(() => {
@@ -146,9 +216,9 @@ export default function App() {
   }, [analysisByPair, selectedPair]);
 
   const activeDetailAnalysis = useMemo(() => {
-    if (mt5WaitMode || !isSynced) return null;
+    if (mt5WaitMode) return null;
     return currentRows.find((r) => r.timeframe === selectedTfDetail) || currentRows[0] || null;
-  }, [currentRows, isSynced, mt5WaitMode, selectedTfDetail]);
+  }, [currentRows, mt5WaitMode, selectedTfDetail]);
 
   return (
     <div className="min-h-screen bg-[#07090d] text-slate-100">
@@ -179,22 +249,19 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => {
-                if (!isSynced) setIsSynced(true);
-                else runCycle();
-              }}
+              onClick={handleManualRefresh}
               disabled={isFetching}
               className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-xs sm:text-sm font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-60 whitespace-nowrap cursor-pointer"
             >
               <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
-              {!isSynced ? 'Démarrer maintenant' : 'Actualiser'}
+              Actualiser
             </button>
           </div>
         </div>
       </header>
 
       <main className="mx-auto max-w-6xl px-5 py-7">
-        {/* Barre de sélection des 4 paires (boutons radio) + minuteur cycle */}
+        {/* Barre de sélection des 4 paires (boutons radio) */}
         <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
           <fieldset aria-label="Sélection de la paire Forex" className="flex flex-wrap items-center gap-2.5">
             {PAIRS.map((pair) => {
@@ -221,26 +288,16 @@ export default function App() {
               );
             })}
           </fieldset>
-
-          <div className="font-mono text-xs sm:text-sm text-slate-300 tabular-nums">
-            {!isSynced ? (
-              <span className="text-amber-400">
-                Synchronisation :59 ({syncTargetStr}) · dans {syncWaitRemaining}s
-              </span>
-            ) : (
-              <span>Prochaine actualisation : {nextRefreshIn}s</span>
-            )}
-          </div>
         </div>
 
         {/* Bannière d'attente MT5 si injoignable */}
-        {mt5WaitMode && isSynced && (
+        {mt5WaitMode && (
           <div className="mb-5 rounded-xl border border-amber-500/40 bg-amber-950/25 px-4 py-3 text-sm font-medium text-amber-200">
-            MetaTrader 5 est temporairement injoignable — nouvelle tentative automatique toutes les 15 secondes.
+            MetaTrader 5 est temporairement injoignable — nouvelle tentative automatique aux prochains créneaux.
           </div>
         )}
 
-        {/* Tableau vertical à 3 colonnes et 7 lignes */}
+        {/* Tableau vertical à 4 colonnes et 6 lignes */}
         <div className="overflow-hidden rounded-2xl border border-[#1e2633] bg-[#0f131a]">
           <div className="overflow-x-auto">
             <table className="w-full border-collapse text-left">
@@ -249,12 +306,13 @@ export default function App() {
                   <th className="px-6 py-4">Timeframe</th>
                   <th className="px-6 py-4">Signal</th>
                   <th className="px-6 py-4">Confluence</th>
+                  <th className="px-6 py-4">Prochaine MAJ</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#171e2b]">
                 {TIMEFRAMES.map((tf) => {
                   const row = currentRows.find((r) => r.timeframe === tf);
-                  const isWait = !isSynced || mt5WaitMode || !row;
+                  const isWait = mt5WaitMode || !row;
                   const isSelectedDetail = selectedTfDetail === tf;
 
                   let signalButtonClass = 'bg-slate-800 text-amber-400';
@@ -294,6 +352,9 @@ export default function App() {
                       <td className="px-6 py-4 font-mono text-xl sm:text-2xl font-bold text-white tabular-nums">
                         {confluenceText}
                       </td>
+                      <td className="px-6 py-4 font-mono text-lg sm:text-xl font-bold text-slate-300 tabular-nums">
+                        {formatMmSs(remainingByTf[tf])}
+                      </td>
                     </tr>
                   );
                 })}
@@ -311,7 +372,7 @@ export default function App() {
             Dernière mise à jour : {lastUpdated}
           </span>
           <span>
-            Exness-MT5Trial16 · {selectedPair} · Cycle 15s
+            Exness-MT5Trial16 · {selectedPair}
           </span>
         </footer>
       </main>

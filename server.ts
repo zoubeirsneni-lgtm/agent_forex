@@ -34,7 +34,6 @@ const BASE_SPOT: Record<ForexPair, number> = {
 };
 
 const TF_SECONDS: Record<(typeof TIMEFRAMES)[number], number> = {
-  '15s': 15,
   '30s': 30,
   '1m': 60,
   '3m': 180,
@@ -208,7 +207,7 @@ async function advancePairMarket(pair: ForexPair): Promise<void> {
     }
   }
 
-  // Micro-tick evolution so 15s/30s/1m/3m/5m/10m/15m progress smoothly every cycle
+  // Micro-tick evolution so 30s/1m/3m/5m/10m/15m progress smoothly every cycle
   state.drift = state.drift * 0.85 + (Math.random() - 0.5) * 0.65;
   const delta = state.drift * pip * 1.4;
   state.spot = Math.max(pip * 10, state.spot + delta);
@@ -307,15 +306,24 @@ async function startServer() {
       }
     }
 
+    const tfsParam = String(req.query.tfs || '').trim();
+    const requestedTfs = tfsParam
+      ? tfsParam
+          .split(',')
+          .map((t) => t.trim())
+          .filter((t): t is (typeof TIMEFRAMES)[number] => (TIMEFRAMES as readonly string[]).includes(t))
+      : [...TIMEFRAMES];
+    const targetTfs = requestedTfs.length > 0 ? requestedTfs : [...TIMEFRAMES];
+
     await Promise.all(PAIRS.map((pair) => advancePairMarket(pair)));
 
     const analysisByPair: Record<ForexPair, TimeframeAnalysis[]> = {} as Record<ForexPair, TimeframeAnalysis[]>;
     for (const pair of PAIRS) {
       const state = marketStore[pair];
-      analysisByPair[pair] = TIMEFRAMES.map((tf) => {
+      analysisByPair[pair] = targetTfs.map((tf) => {
         const candles = state.tfCandles[tf];
         const htfCandle = state.htfCandles[
-          tf === '15s' || tf === '30s'
+          tf === '30s'
             ? 'M15'
             : tf === '1m' || tf === '3m'
               ? 'H1'

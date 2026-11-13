@@ -1,7 +1,7 @@
 export const PAIRS = ['EURUSDm', 'GBPUSDm', 'USDJPYm', 'AUDUSDm'] as const;
 export type ForexPair = (typeof PAIRS)[number];
 
-export const TIMEFRAMES = ['15s', '30s', '1m', '3m', '5m', '10m', '15m'] as const;
+export const TIMEFRAMES = ['30s', '1m', '3m', '5m', '10m', '15m'] as const;
 export type Timeframe = (typeof TIMEFRAMES)[number];
 
 export type PivotHtf = 'M15' | 'H1' | 'H4' | 'D1';
@@ -39,29 +39,9 @@ export interface ZoneConfig {
 }
 
 export const ZONE_CONFIG_BY_TF: Record<Timeframe, ZoneConfig> = {
-  '15s': {
-    zoneId: 1,
-    zoneLabel: 'Zone 1 (15s, 30s)',
-    emaShort: 5,
-    emaLong: 13,
-    bbPeriod: 10,
-    bbStd: 1.5,
-    rsiPeriod: 5,
-    rsiOverbought: 80,
-    rsiOversold: 20,
-    macdFast: 5,
-    macdSlow: 13,
-    macdSignal: 3,
-    stochK: 5,
-    stochSmooth: 3,
-    stochD: 3,
-    atrPeriod: 7,
-    tickVolMa: 10,
-    pivotHtf: 'M15',
-  },
   '30s': {
     zoneId: 1,
-    zoneLabel: 'Zone 1 (15s, 30s)',
+    zoneLabel: 'Zone 1 (30s)',
     emaShort: 5,
     emaLong: 13,
     bbPeriod: 10,

@@ -3,7 +3,7 @@
 """
 Forex Agent Dashboard - Agent autonome Windows 10 + MetaTrader 5 (Exness-MT5Trial16)
 Surveillance temps réel de 4 paires (EURUSDm, GBPUSDm, USDJPYm, AUDUSDm)
-sur 7 timeframes (15s, 30s, 1m, 3m, 5m, 10m, 15m) avec 8 indicateurs techniques.
+sur 6 timeframes (30s, 1m, 3m, 5m, 10m, 15m) avec 8 indicateurs techniques.
 """
 
 import json
@@ -33,23 +33,10 @@ DASHBOARD_HTML_PATH = DASHBOARD_DIR / "forex_dashboard.html"
 
 MT5_SERVER = "Exness-MT5Trial16"
 PAIRS = ["EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm"]
-TIMEFRAMES = ["15s", "30s", "1m", "3m", "5m", "10m", "15m"]
-
-REFRESH_SECONDS = 15
+TIMEFRAMES = ["30s", "1m", "3m", "5m", "10m", "15m"]
 
 # Paramètres stricts par zone
 ZONES: Dict[str, Dict[str, Any]] = {
-    "15s": {
-        "zone": 1,
-        "ema_short": 5, "ema_long": 13,
-        "bb_period": 10, "bb_std": 1.5,
-        "rsi_period": 5, "rsi_ob": 80, "rsi_os": 20,
-        "macd_fast": 5, "macd_slow": 13, "macd_signal": 3,
-        "stoch_k": 5, "stoch_smooth": 3, "stoch_d": 3,
-        "atr_period": 7,
-        "vol_ma": 10,
-        "pivot_htf": "M15",
-    },
     "30s": {
         "zone": 1,
         "ema_short": 5, "ema_long": 13,
@@ -159,7 +146,7 @@ def ensure_mt5_connected() -> bool:
 
 
 def fetch_subminute_candles(symbol: str, seconds: int, count: int = 120) -> Optional[pd.DataFrame]:
-    """Construit des bougies 15s ou 30s à partir des ticks MT5."""
+    """Construit des bougies 30s à partir des ticks MT5."""
     if mt5 is None:
         return None
     now = datetime.now()
@@ -241,9 +228,7 @@ def compute_atr(df: pd.DataFrame, period: int) -> float:
 
 def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
     cfg = ZONES[tf]
-    if tf == "15s":
-        df = fetch_subminute_candles(symbol, 15, 140)
-    elif tf == "30s":
+    if tf == "30s":
         df = fetch_subminute_candles(symbol, 30, 140)
     else:
         tf_map = {
@@ -355,6 +340,43 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
 
 
 # ==============================================================================
+# PLANIFICATION HORLOGE RÉELLE PAR TIMEFRAME
+# ==============================================================================
+def get_next_target_epoch_sec(tf: str, after_epoch_sec: int) -> int:
+    base = datetime.fromtimestamp(after_epoch_sec).replace(second=0, microsecond=0)
+    if tf == "30s":
+        t25 = int((base + timedelta(seconds=25)).timestamp())
+        if t25 > after_epoch_sec:
+            return t25
+        t55 = int((base + timedelta(seconds=55)).timestamp())
+        if t55 > after_epoch_sec:
+            return t55
+        return int((base + timedelta(minutes=1, seconds=25)).timestamp())
+
+    if tf in ("1m", "3m", "5m"):
+        t55 = int((base + timedelta(seconds=55)).timestamp())
+        if t55 > after_epoch_sec:
+            return t55
+        return int((base + timedelta(minutes=1, seconds=55)).timestamp())
+
+    if tf == "10m":
+        for offset in range(0, 3):
+            cand = base + timedelta(minutes=offset, seconds=55)
+            cand_sec = int(cand.timestamp())
+            if cand.minute % 2 == 1 and cand_sec > after_epoch_sec:
+                return cand_sec
+
+    # 15m : :55 des minutes 02, 05, 08, 11, 14, 17, 20... (minute % 3 == 2)
+    for offset in range(0, 4):
+        cand = base + timedelta(minutes=offset, seconds=55)
+        cand_sec = int(cand.timestamp())
+        if cand.minute % 3 == 2 and cand_sec > after_epoch_sec:
+            return cand_sec
+
+    return after_epoch_sec + 180
+
+
+# ==============================================================================
 # GÉNÉRATION HTML AUTONOME (dashboard/forex_dashboard.html)
 # ==============================================================================
 def render_dashboard_html(
@@ -393,7 +415,6 @@ def render_dashboard_html(
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="refresh" content="15" />
   <title>Forex Agent Dashboard</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -415,7 +436,7 @@ def render_dashboard_html(
       padding: 12px 22px; border-radius: 10px;
       background: #0f131a; border: 1px solid #1e2633;
       cursor: pointer; font-weight: 700; font-size: 15px;
-      transition: all 0.15s ease;
+      transition: background-color 0.15s ease, border-color 0.15s ease;
     }}
     .pair-label input {{ accent-color: #10b981; width: 16px; height: 16px; }}
     .pair-label.active {{ background: #13231d; border-color: #10b981; color: #34d399; }}
@@ -445,6 +466,7 @@ def render_dashboard_html(
     .sig-NEUTRE {{ background: #334155; color: #e2e8f0; }}
     .sig-WAIT {{ background: #1e293b; color: #fbbf24; }}
     .conf-cell {{ font-family: Consolas, monospace; font-size: 22px; font-weight: 700; color: #f8fafc; }}
+    .maj-cell {{ font-family: Consolas, monospace; font-size: 20px; font-weight: 700; color: #cbd5e1; }}
     .footer {{ margin-top: 16px; color: #94a3b8; font-size: 14px; font-family: Consolas, monospace; }}
   </style>
 </head>
@@ -459,6 +481,7 @@ def render_dashboard_html(
             <th>Timeframe</th>
             <th>Signal</th>
             <th>Confluence</th>
+            <th>Prochaine MAJ</th>
           </tr>
         </thead>
         <tbody id="tableBody"></tbody>
@@ -475,6 +498,41 @@ def render_dashboard_html(
 
     let selectedPair = localStorage.getItem(STORAGE_PAIR);
     if (!PAIRS.includes(selectedPair)) selectedPair = "EURUSDm";
+
+    function getNextTargetSec(tf, afterSec) {{
+      const d = new Date(afterSec * 1000);
+      const y = d.getFullYear(), mo = d.getMonth(), da = d.getDate(), h = d.getHours(), m = d.getMinutes();
+      if (tf === "30s") {{
+        const t25 = Math.floor(new Date(y, mo, da, h, m, 25, 0).getTime() / 1000);
+        if (t25 > afterSec) return t25;
+        const t55 = Math.floor(new Date(y, mo, da, h, m, 55, 0).getTime() / 1000);
+        if (t55 > afterSec) return t55;
+        return Math.floor(new Date(y, mo, da, h, m + 1, 25, 0).getTime() / 1000);
+      }}
+      if (tf === "1m" || tf === "3m" || tf === "5m") {{
+        const t55 = Math.floor(new Date(y, mo, da, h, m, 55, 0).getTime() / 1000);
+        if (t55 > afterSec) return t55;
+        return Math.floor(new Date(y, mo, da, h, m + 1, 55, 0).getTime() / 1000);
+      }}
+      if (tf === "10m") {{
+        for (let off = 0; off <= 2; off++) {{
+          const c = new Date(y, mo, da, h, m + off, 55, 0);
+          const cs = Math.floor(c.getTime() / 1000);
+          if (c.getMinutes() % 2 === 1 && cs > afterSec) return cs;
+        }}
+      }}
+      for (let off = 0; off <= 3; off++) {{
+        const c = new Date(y, mo, da, h, m + off, 55, 0);
+        const cs = Math.floor(c.getTime() / 1000);
+        if (c.getMinutes() % 3 === 2 && cs > afterSec) return cs;
+      }}
+      return afterSec + 180;
+    }}
+
+    function fmtMmSs(sec) {{
+      const s = Math.max(0, Math.floor(sec));
+      return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+    }}
 
     function renderPairs() {{
       const wrap = document.getElementById("pairSelector");
@@ -502,6 +560,7 @@ def render_dashboard_html(
     function renderTable() {{
       const tbody = document.getElementById("tableBody");
       tbody.innerHTML = "";
+      const nowSec = Math.floor(Date.now() / 1000);
       const rows = DATA[selectedPair] || [];
       rows.forEach(r => {{
         const tr = document.createElement("tr");
@@ -519,9 +578,16 @@ def render_dashboard_html(
         tdConf.className = "conf-cell";
         tdConf.textContent = r.confluence_label;
 
+        const tdMaj = document.createElement("td");
+        tdMaj.className = "maj-cell";
+        tdMaj.dataset.tf = r.timeframe;
+        const target = getNextTargetSec(r.timeframe, nowSec);
+        tdMaj.textContent = fmtMmSs(target - nowSec);
+
         tr.appendChild(tdTf);
         tr.appendChild(tdSig);
         tr.appendChild(tdConf);
+        tr.appendChild(tdMaj);
         tbody.appendChild(tr);
       }});
       document.getElementById("footerTime").textContent = "Dernière mise à jour : " + UPDATED_AT;
@@ -529,6 +595,18 @@ def render_dashboard_html(
 
     renderPairs();
     renderTable();
+
+    setInterval(() => {{
+      const nowSec = Math.floor(Date.now() / 1000);
+      document.querySelectorAll("[data-tf]").forEach(el => {{
+        const tf = el.dataset.tf;
+        const target = getNextTargetSec(tf, nowSec);
+        el.textContent = fmtMmSs(target - nowSec);
+      }});
+      if (nowSec % 30 === 26 || nowSec % 60 === 56) {{
+        window.location.reload();
+      }}
+    }}, 500);
   </script>
 </body>
 </html>
@@ -542,64 +620,57 @@ def write_dashboard_atomically(html_content: str) -> None:
     os.replace(tmp_path, DASHBOARD_HTML_PATH)
 
 
-def sync_to_second_59() -> None:
-    now = datetime.now()
-    sec = now.second
-    if sec == 59:
-        return
-    wait_sec = 59 - sec
-    target = (now + timedelta(seconds=wait_sec)).strftime("%H:%M:%S")
-    print(f"[SYNC] Synchronisation au démarrage : attente jusqu'à la 59e seconde ({target}, dans {wait_sec}s)...")
-    while RUNNING:
-        current = datetime.now()
-        if current.second == 59:
-            break
-        time.sleep(0.25)
-
-
 def main() -> None:
     print("=== Forex Agent Dashboard (Exness MT5) ===")
     print(f"Serveur MT5 cible : {MT5_SERVER}")
     print(f"Fichier dashboard : {DASHBOARD_HTML_PATH}")
 
-    sync_to_second_59()
+    now_sec = int(time.time())
+    targets = {tf: get_next_target_epoch_sec(tf, now_sec) for tf in TIMEFRAMES}
+    results: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {p: {} for p in PAIRS}
 
-    browser_opened = False
+    # Calcul initial complet des 6 timeframes
+    mt5_ok = ensure_mt5_connected()
+    if mt5_ok:
+        for pair in PAIRS:
+            for tf in TIMEFRAMES:
+                try:
+                    results[pair][tf] = analyze_pair_timeframe(pair, tf)
+                except Exception as exc:
+                    print(f"[ERREUR] Calcul {pair} {tf} : {exc}")
+                    results[pair][tf] = None
+    else:
+        print("[AVERTISSEMENT] MetaTrader 5 injoignable -> affichage WAIT partout.")
+
+    updated_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    write_dashboard_atomically(render_dashboard_html(results, mt5_ok, updated_str))
+    url = DASHBOARD_HTML_PATH.resolve().as_uri()
+    print(f"[NAVIGATEUR] Ouverture automatique : {url}")
+    webbrowser.open(url)
 
     while RUNNING:
-        cycle_start = time.time()
-        mt5_ok = ensure_mt5_connected()
-        results: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
+        time.sleep(0.25)
+        cur_sec = int(time.time())
+        due_tfs = [tf for tf in TIMEFRAMES if cur_sec >= targets[tf]]
+        if not due_tfs:
+            continue
 
+        for tf in due_tfs:
+            targets[tf] = get_next_target_epoch_sec(tf, cur_sec)
+
+        mt5_ok = ensure_mt5_connected()
         if mt5_ok:
             for pair in PAIRS:
-                results[pair] = {}
-                for tf in TIMEFRAMES:
+                for tf in due_tfs:
                     try:
                         results[pair][tf] = analyze_pair_timeframe(pair, tf)
                     except Exception as exc:
                         print(f"[ERREUR] Calcul {pair} {tf} : {exc}")
                         results[pair][tf] = None
-        else:
-            print("[AVERTISSEMENT] MetaTrader 5 injoignable -> affichage WAIT partout.")
 
         updated_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        html = render_dashboard_html(results, mt5_ok, updated_str)
-        write_dashboard_atomically(html)
-
-        if not browser_opened:
-            browser_opened = True
-            url = DASHBOARD_HTML_PATH.resolve().as_uri()
-            print(f"[NAVIGATEUR] Ouverture automatique : {url}")
-            webbrowser.open(url)
-
-        print(f"[CYCLE] Mise à jour effectuée à {updated_str} (MT5={'OK' if mt5_ok else 'WAIT'})")
-
-        elapsed = time.time() - cycle_start
-        sleep_time = max(1.0, REFRESH_SECONDS - elapsed)
-        end_wait = time.time() + sleep_time
-        while RUNNING and time.time() < end_wait:
-            time.sleep(0.25)
+        write_dashboard_atomically(render_dashboard_html(results, mt5_ok, updated_str))
+        print(f"[CYCLE] MAJ {', '.join(due_tfs)} effectuée à {updated_str} (MT5={'OK' if mt5_ok else 'WAIT'})")
 
 
 if __name__ == "__main__":
