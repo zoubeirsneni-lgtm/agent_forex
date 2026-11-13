@@ -261,6 +261,9 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
 
     # 2. Bollinger Bands
     bb_mid = float(close.rolling(cfg["bb_period"]).mean().iloc[-1])
+    bb_std_val = float(close.rolling(cfg["bb_period"]).std(ddof=0).iloc[-1])
+    bb_upper = bb_mid + cfg["bb_std"] * bb_std_val
+    bb_lower = bb_mid - cfg["bb_std"] * bb_std_val
     v_bb = 1 if c_now > bb_mid else -1
 
     # 3. RSI
@@ -282,7 +285,9 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
     raw_k = (100.0 * (close - lowest_low) / denom).fillna(50.0)
     k_line = raw_k.rolling(cfg["stoch_smooth"]).mean()
     d_line = k_line.rolling(cfg["stoch_d"]).mean()
-    v_stoch = 1 if float(k_line.iloc[-1]) > float(d_line.iloc[-1]) else -1
+    k_val = float(k_line.iloc[-1])
+    d_val = float(d_line.iloc[-1])
+    v_stoch = 1 if k_val > d_val else -1
 
     # 6. ATR
     atr_val = compute_atr(df, cfg["atr_period"])
@@ -308,6 +313,53 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
     # 8. Pivot Points
     pivot_p = (htf_bar["high"] + htf_bar["low"] + htf_bar["close"]) / 3.0
     v_pivot = 1 if c_now > pivot_p else -1
+
+    digits = 3 if symbol == "USDJPYm" else 5
+    zone_tfs = "30s" if tf == "30s" else ("1m, 3m" if tf in ("1m", "3m") else ("5m, 10m" if tf in ("5m", "10m") else "15m"))
+    zone_label = f"Zone {cfg['zone']} ({zone_tfs})"
+
+    indicators = [
+        {
+            "name": f"EMA ({cfg['ema_short']}/{cfg['ema_long']})",
+            "vote": v_ema,
+            "summary": f"{ema_s:.{digits}f} vs {ema_l:.{digits}f}",
+        },
+        {
+            "name": f"Bollinger ({cfg['bb_period']}, {cfg['bb_std']})",
+            "vote": v_bb,
+            "summary": f"M={bb_mid:.{digits}f} [{bb_lower:.{digits}f}-{bb_upper:.{digits}f}]",
+        },
+        {
+            "name": f"RSI ({cfg['rsi_period']}) [{cfg['rsi_ob']}/{cfg['rsi_os']}]",
+            "vote": v_rsi,
+            "summary": f"{rsi_val:.1f}",
+        },
+        {
+            "name": f"MACD ({cfg['macd_fast']}/{cfg['macd_slow']}/{cfg['macd_signal']})",
+            "vote": v_macd,
+            "summary": f"Hist={'+' if macd_hist >= 0 else ''}{macd_hist:.{digits + 1}f}",
+        },
+        {
+            "name": f"Stochastique ({cfg['stoch_k']}/{cfg['stoch_smooth']}/{cfg['stoch_d']})",
+            "vote": v_stoch,
+            "summary": f"%K={k_val:.1f} / %D={d_val:.1f}",
+        },
+        {
+            "name": f"ATR ({cfg['atr_period']})",
+            "vote": v_atr,
+            "summary": f"{atr_val:.{digits}f}",
+        },
+        {
+            "name": f"Tick Volume (MA {cfg['vol_ma']})",
+            "vote": v_vol,
+            "summary": f"Ratio={vol_ratio:.2f}x",
+        },
+        {
+            "name": f"Pivot Points ({cfg['pivot_htf']})",
+            "vote": v_pivot,
+            "summary": f"P={pivot_p:.{digits}f}",
+        },
+    ]
 
     votes = [v_ema, v_bb, v_rsi, v_macd, v_stoch, v_atr, v_vol, v_pivot]
     buy_count = sum(1 for v in votes if v == 1)
@@ -336,6 +388,9 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
         "buy_count": buy_count,
         "sell_count": sell_count,
         "price": c_now,
+        "zone_label": zone_label,
+        "pivot_htf": cfg["pivot_htf"],
+        "indicators": indicators,
     }
 
 
@@ -388,6 +443,9 @@ def render_dashboard_html(
     for pair in PAIRS:
         rows = []
         for tf in TIMEFRAMES:
+            cfg = ZONES[tf]
+            zone_tfs = "30s" if tf == "30s" else ("1m, 3m" if tf in ("1m", "3m") else ("5m, 10m" if tf in ("5m", "10m") else "15m"))
+            default_zone_label = f"Zone {cfg['zone']} ({zone_tfs})"
             row = results.get(pair, {}).get(tf)
             if not mt5_ok or row is None:
                 rows.append({
@@ -396,6 +454,11 @@ def render_dashboard_html(
                     "direction": "WAIT",
                     "signal_label": "WAIT",
                     "confluence_label": "WAIT",
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "zone_label": default_zone_label,
+                    "pivot_htf": cfg["pivot_htf"],
+                    "indicators": [],
                 })
             else:
                 rows.append({
@@ -404,6 +467,11 @@ def render_dashboard_html(
                     "direction": row["direction"],
                     "signal_label": row["signal_label"],
                     "confluence_label": row["confluence_label"],
+                    "buy_count": row["buy_count"],
+                    "sell_count": row["sell_count"],
+                    "zone_label": row.get("zone_label", default_zone_label),
+                    "pivot_htf": row.get("pivot_htf", cfg["pivot_htf"]),
+                    "indicators": row.get("indicators", []),
                 })
         payload[pair] = rows
 
@@ -417,78 +485,335 @@ def render_dashboard_html(
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Forex Agent Dashboard</title>
   <style>
+    :root {{
+      --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+      --font-mono: "JetBrains Mono", Consolas, ui-monospace, monospace;
+    }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
       background-color: #07090d;
       color: #f1f5f9;
-      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-family: var(--font-sans);
       min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }}
+    .font-mono {{ font-family: var(--font-mono); }}
+    .tabular-nums {{ font-variant-numeric: tabular-nums; }}
+
+    /* A. En-tête */
+    .header {{
+      border-bottom: 1px solid #1e2633;
+      background-color: #0a0d13;
+    }}
+    .header-inner {{
+      max-width: 1152px;
+      margin: 0 auto;
+      padding: 16px 20px;
       display: flex;
-      flex-direction: column;
       align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }}
+    .header-title {{
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: #ffffff;
+      white-space: nowrap;
+    }}
+    .refresh-btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background-color: #059669;
+      color: #ffffff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-family: var(--font-sans);
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background-color 0.15s ease;
+    }}
+    .refresh-btn:hover {{ background-color: #10b981; }}
+
+    /* Conteneur principal */
+    .main {{
+      max-width: 1152px;
+      margin: 0 auto;
       padding: 28px 20px;
     }}
-    .container {{ width: 100%; max-width: 1080px; }}
-    h1 {{ font-size: 28px; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 20px; }}
-    .pairs {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }}
+
+    /* B. Barre de sélection des 4 paires */
+    .pairs-bar {{
+      margin-bottom: 24px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }}
     .pair-label {{
-      display: inline-flex; align-items: center; gap: 8px;
-      padding: 12px 22px; border-radius: 10px;
-      background: #0f131a; border: 1px solid #1e2633;
-      cursor: pointer; font-weight: 700; font-size: 15px;
-      transition: background-color 0.15s ease, border-color 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 20px;
+      border-radius: 12px;
+      border: 1px solid #1e2633;
+      background-color: #0f131a;
+      color: #cbd5e1;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 15px;
+      cursor: pointer;
+      user-select: none;
+      transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
     }}
-    .pair-label input {{ accent-color: #10b981; width: 16px; height: 16px; }}
-    .pair-label.active {{ background: #13231d; border-color: #10b981; color: #34d399; }}
+    .pair-label:hover {{
+      border-color: #475569;
+      color: #ffffff;
+    }}
+    .pair-label.active {{
+      border-color: #10b981;
+      background-color: #052e1f50;
+      color: #6ee7b7;
+    }}
+    .pair-label input {{
+      width: 16px;
+      height: 16px;
+      accent-color: #10b981;
+      cursor: pointer;
+    }}
+
+    /* C. Tableau 4 colonnes et 6 lignes */
     .table-wrap {{
-      background: #0f131a; border: 1px solid #1e2633;
-      border-radius: 14px; overflow: hidden;
+      background-color: #0f131a;
+      border: 1px solid #1e2633;
+      border-radius: 16px;
+      overflow: hidden;
     }}
-    table {{ width: 100%; border-collapse: collapse; }}
+    .table-scroll {{ overflow-x: auto; }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }}
+    thead tr {{
+      background-color: #0a0d13;
+      border-bottom: 1px solid #1e2633;
+    }}
     th {{
-      text-align: left; padding: 14px 18px;
-      font-size: 13px; color: #94a3b8; font-weight: 600;
-      border-bottom: 1px solid #1e2633; background: #0b0e14;
+      padding: 16px 24px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #94a3b8;
     }}
+    tbody tr {{
+      border-bottom: 1px solid #171e2b;
+      cursor: pointer;
+      transition: background-color 0.15s ease;
+    }}
+    tbody tr:last-child {{ border-bottom: none; }}
+    tbody tr:hover {{ background-color: #121822; }}
+    tbody tr.selected {{ background-color: #141b26; }}
     td {{
-      padding: 14px 18px; border-bottom: 1px solid #161d29;
-      vertical-align: middle; font-variant-numeric: tabular-nums;
+      padding: 14px 24px;
+      vertical-align: middle;
+      font-variant-numeric: tabular-nums;
     }}
-    tr:last-child td {{ border-bottom: none; }}
-    .tf-cell {{ font-family: Consolas, monospace; font-size: 18px; font-weight: 700; color: #e2e8f0; }}
+    .tf-cell {{
+      font-family: var(--font-mono);
+      font-size: 20px;
+      font-weight: 700;
+      color: #f1f5f9;
+    }}
     .sig-btn {{
-      display: inline-block; min-width: 190px; text-align: center;
-      padding: 10px 18px; border-radius: 10px;
-      font-family: Consolas, monospace; font-size: 24px; font-weight: 800;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 200px;
+      padding: 10px 20px;
+      border-radius: 12px;
+      font-family: var(--font-mono);
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      text-align: center;
     }}
-    .sig-ACHAT {{ background: #059669; color: #ffffff; }}
-    .sig-VENTE {{ background: #dc2626; color: #ffffff; }}
-    .sig-NEUTRE {{ background: #334155; color: #e2e8f0; }}
-    .sig-WAIT {{ background: #1e293b; color: #fbbf24; }}
-    .conf-cell {{ font-family: Consolas, monospace; font-size: 22px; font-weight: 700; color: #f8fafc; }}
-    .maj-cell {{ font-family: Consolas, monospace; font-size: 20px; font-weight: 700; color: #cbd5e1; }}
-    .footer {{ margin-top: 16px; color: #94a3b8; font-size: 14px; font-family: Consolas, monospace; }}
+    .sig-ACHAT {{ background-color: #059669; color: #ffffff; }}
+    .sig-VENTE {{ background-color: #dc2626; color: #ffffff; }}
+    .sig-NEUTRE {{ background-color: #334155; color: #f1f5f9; }}
+    .sig-WAIT {{ background-color: #1e293b; color: #fbbf24; }}
+    .conf-cell {{
+      font-family: var(--font-mono);
+      font-size: 24px;
+      font-weight: 700;
+      color: #ffffff;
+    }}
+    .maj-cell {{
+      font-family: var(--font-mono);
+      font-size: 20px;
+      font-weight: 700;
+      color: #cbd5e1;
+    }}
+
+    /* D. Panneau Détail des 8 indicateurs */
+    .details-panel {{
+      margin-top: 24px;
+      border-radius: 12px;
+      border: 1px solid #1e2633;
+      background-color: #0f131a;
+      padding: 20px;
+    }}
+    .details-header {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      border-bottom: 1px solid #1e2633;
+      padding-bottom: 12px;
+      margin-bottom: 16px;
+    }}
+    .details-title-wrap {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 12px;
+    }}
+    .details-title {{
+      font-size: 16px;
+      font-weight: 700;
+      color: #f1f5f9;
+    }}
+    .details-zone {{
+      font-size: 12px;
+      font-weight: 500;
+      color: #94a3b8;
+    }}
+    .details-counts {{
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #cbd5e1;
+      font-variant-numeric: tabular-nums;
+    }}
+    .details-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }}
+    @media (min-width: 1024px) {{
+      .details-grid {{
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }}
+    }}
+    .ind-card {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-radius: 8px;
+      border: 1px solid #1a2230;
+      background-color: #090c11;
+      padding: 10px 14px;
+    }}
+    .ind-info {{ min-width: 0; }}
+    .ind-name {{
+      font-size: 12px;
+      font-weight: 600;
+      color: #e2e8f0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .ind-summary {{
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #94a3b8;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-variant-numeric: tabular-nums;
+    }}
+    .ind-badge {{
+      flex-shrink: 0;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }}
+    .ind-badge-buy {{
+      background-color: #04785715;
+      color: #34d399;
+    }}
+    .ind-badge-sell {{
+      background-color: #dc262615;
+      color: #f87171;
+    }}
+
+    /* E. Pied de page */
+    .footer {{
+      margin-top: 24px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: #94a3b8;
+      font-size: 13px;
+    }}
+    .footer-time {{
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }}
   </style>
 </head>
 <body>
-  <div class="container">
-    <h1>Forex Agent Dashboard</h1>
-    <div class="pairs" id="pairSelector"></div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Timeframe</th>
-            <th>Signal</th>
-            <th>Confluence</th>
-            <th>Prochaine MAJ</th>
-          </tr>
-        </thead>
-        <tbody id="tableBody"></tbody>
-      </table>
+  <header class="header">
+    <div class="header-inner">
+      <h1 class="header-title">Forex Agent Dashboard</h1>
+      <button type="button" class="refresh-btn" id="refreshBtn">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+          <path d="M3 3v5h5" />
+          <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+          <path d="M16 16h5v5" />
+        </svg>
+        Actualiser
+      </button>
     </div>
-    <div class="footer" id="footerTime"></div>
-  </div>
+  </header>
+
+  <main class="main">
+    <div class="pairs-bar" id="pairSelector" role="radiogroup" aria-label="Sélection de la paire Forex"></div>
+
+    <div class="table-wrap">
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Timeframe</th>
+              <th>Signal</th>
+              <th>Confluence</th>
+              <th>Prochaine MAJ</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <section class="details-panel" id="detailsPanel"></section>
+
+    <footer class="footer">
+      <span class="footer-time" id="footerTime"></span>
+      <span id="footerPair"></span>
+    </footer>
+  </main>
 
   <script>
     const DATA = {data_json};
@@ -498,6 +823,11 @@ def render_dashboard_html(
 
     let selectedPair = localStorage.getItem(STORAGE_PAIR);
     if (!PAIRS.includes(selectedPair)) selectedPair = "EURUSDm";
+    let selectedTfDetail = "1m";
+
+    document.getElementById("refreshBtn").addEventListener("click", () => {{
+      window.location.reload();
+    }});
 
     function getNextTargetSec(tf, afterSec) {{
       const d = new Date(afterSec * 1000);
@@ -534,6 +864,12 @@ def render_dashboard_html(
       return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
     }}
 
+    function setSelectedTfDetail(tf) {{
+      selectedTfDetail = tf;
+      renderTable();
+      renderDetails();
+    }}
+
     function renderPairs() {{
       const wrap = document.getElementById("pairSelector");
       wrap.innerHTML = "";
@@ -550,6 +886,7 @@ def render_dashboard_html(
           localStorage.setItem(STORAGE_PAIR, p);
           renderPairs();
           renderTable();
+          renderDetails();
         }});
         lbl.appendChild(inp);
         lbl.appendChild(document.createTextNode(p));
@@ -564,6 +901,9 @@ def render_dashboard_html(
       const rows = DATA[selectedPair] || [];
       rows.forEach(r => {{
         const tr = document.createElement("tr");
+        if (r.timeframe === selectedTfDetail) tr.className = "selected";
+        tr.addEventListener("click", () => setSelectedTfDetail(r.timeframe));
+
         const tdTf = document.createElement("td");
         tdTf.className = "tf-cell";
         tdTf.textContent = r.timeframe;
@@ -591,10 +931,84 @@ def render_dashboard_html(
         tbody.appendChild(tr);
       }});
       document.getElementById("footerTime").textContent = "Dernière mise à jour : " + UPDATED_AT;
+      document.getElementById("footerPair").textContent = "Exness-MT5Trial16 · " + selectedPair;
+    }}
+
+    function renderDetails() {{
+      const panel = document.getElementById("detailsPanel");
+      const rows = DATA[selectedPair] || [];
+      const row = rows.find(r => r.timeframe === selectedTfDetail) || rows[0];
+      if (!row || !Array.isArray(row.indicators) || row.indicators.length === 0) {{
+        panel.style.display = "none";
+        panel.innerHTML = "";
+        return;
+      }}
+
+      panel.style.display = "block";
+      panel.innerHTML = "";
+
+      const header = document.createElement("div");
+      header.className = "details-header";
+
+      const titleWrap = document.createElement("div");
+      titleWrap.className = "details-title-wrap";
+
+      const title = document.createElement("h3");
+      title.className = "details-title";
+      title.textContent = "Détail des 8 indicateurs — " + row.pair + " (" + row.timeframe + ")";
+
+      const zone = document.createElement("span");
+      zone.className = "details-zone";
+      zone.textContent = row.zone_label + " · Pivot " + row.pivot_htf;
+
+      titleWrap.appendChild(title);
+      titleWrap.appendChild(zone);
+
+      const counts = document.createElement("div");
+      counts.className = "details-counts";
+      counts.textContent = "Achat : " + row.buy_count + "/8 · Vente : " + row.sell_count + "/8";
+
+      header.appendChild(titleWrap);
+      header.appendChild(counts);
+      panel.appendChild(header);
+
+      const grid = document.createElement("div");
+      grid.className = "details-grid";
+
+      row.indicators.forEach(ind => {{
+        const isBuy = ind.vote === 1;
+        const card = document.createElement("div");
+        card.className = "ind-card";
+
+        const info = document.createElement("div");
+        info.className = "ind-info";
+
+        const nameEl = document.createElement("div");
+        nameEl.className = "ind-name";
+        nameEl.textContent = ind.name;
+
+        const sumEl = document.createElement("div");
+        sumEl.className = "ind-summary";
+        sumEl.textContent = ind.summary;
+
+        info.appendChild(nameEl);
+        info.appendChild(sumEl);
+
+        const badge = document.createElement("span");
+        badge.className = "ind-badge " + (isBuy ? "ind-badge-buy" : "ind-badge-sell");
+        badge.textContent = isBuy ? "+1 ACHAT" : "-1 VENTE";
+
+        card.appendChild(info);
+        card.appendChild(badge);
+        grid.appendChild(card);
+      }});
+
+      panel.appendChild(grid);
     }}
 
     renderPairs();
     renderTable();
+    renderDetails();
 
     setInterval(() => {{
       const nowSec = Math.floor(Date.now() / 1000);
