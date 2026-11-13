@@ -318,6 +318,10 @@ async function startServer() {
     await Promise.all(PAIRS.map((pair) => advancePairMarket(pair)));
 
     const analysisByPair: Record<ForexPair, TimeframeAnalysis[]> = {} as Record<ForexPair, TimeframeAnalysis[]>;
+    const priceHistoryByPair: Record<ForexPair, { time: string; price: number }[]> = {} as Record<
+      ForexPair,
+      { time: string; price: number }[]
+    >;
     for (const pair of PAIRS) {
       const state = marketStore[pair];
       analysisByPair[pair] = targetTfs.map((tf) => {
@@ -333,6 +337,14 @@ async function startServer() {
         ];
         return analyzeTimeframe(pair, tf, candles, htfCandle);
       });
+      priceHistoryByPair[pair] = state.tfCandles['30s'].slice(-40).map((c) => ({
+        time: new Date(c.time * 1000).toLocaleTimeString('fr-FR', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        }),
+        price: c.close,
+      }));
     }
 
     res.json({
@@ -340,6 +352,7 @@ async function startServer() {
       source: 'live',
       updatedAt,
       analysisByPair,
+      priceHistoryByPair,
     });
   });
 

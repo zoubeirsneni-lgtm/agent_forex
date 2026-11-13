@@ -179,6 +179,7 @@ export interface TimeframeAnalysis {
   sellCount: number;
   confluence: number;
   confluenceLabel: string;
+  core5Alignment: 'ACHAT' | 'VENTE' | null;
   indicators: IndicatorResult[];
 }
 
@@ -429,6 +430,13 @@ export function analyzeTimeframe(
     signalLabel = `${sellPct}% VENTE`;
   }
 
+  const core5Votes: Vote[] = [emaVote, bbVote, rsiVote, macdVote, stochVote];
+  const core5Alignment: 'ACHAT' | 'VENTE' | null = core5Votes.every((v) => v === 1)
+    ? 'ACHAT'
+    : core5Votes.every((v) => v === -1)
+      ? 'VENTE'
+      : null;
+
   return {
     pair,
     timeframe,
@@ -441,6 +449,7 @@ export function analyzeTimeframe(
     sellCount,
     confluence,
     confluenceLabel: `${confluence}/8`,
+    core5Alignment,
     indicators,
   };
 }

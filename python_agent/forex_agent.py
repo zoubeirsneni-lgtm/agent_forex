@@ -378,6 +378,26 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
         direction = "NEUTRE"
         signal_label = "50% NEUTRE"
 
+    price_series: List[Dict[str, Any]] = []
+    if tf == "30s":
+        tail_df = df.tail(40)
+        for _, bar in tail_df.iterrows():
+            if "dt" in bar and hasattr(bar["dt"], "strftime"):
+                t_str = bar["dt"].strftime("%H:%M:%S")
+            elif "time" in bar:
+                t_str = datetime.fromtimestamp(int(bar["time"])).strftime("%H:%M:%S")
+            else:
+                t_str = ""
+            price_series.append({"time": t_str, "price": float(bar["close"])})
+
+    core5_votes = [v_ema, v_bb, v_rsi, v_macd, v_stoch]
+    if all(v == 1 for v in core5_votes):
+        core5_alignment = "ACHAT"
+    elif all(v == -1 for v in core5_votes):
+        core5_alignment = "VENTE"
+    else:
+        core5_alignment = None
+
     return {
         "pair": symbol,
         "timeframe": tf,
@@ -385,12 +405,14 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
         "signal_label": signal_label,
         "confluence": confluence,
         "confluence_label": f"{confluence}/8",
+        "core5_alignment": core5_alignment,
         "buy_count": buy_count,
         "sell_count": sell_count,
         "price": c_now,
         "zone_label": zone_label,
         "pivot_htf": cfg["pivot_htf"],
         "indicators": indicators,
+        "price_series": price_series,
     }
 
 
@@ -454,6 +476,7 @@ def render_dashboard_html(
                     "direction": "WAIT",
                     "signal_label": "WAIT",
                     "confluence_label": "WAIT",
+                    "core5_alignment": None,
                     "buy_count": 0,
                     "sell_count": 0,
                     "zone_label": default_zone_label,
@@ -467,6 +490,7 @@ def render_dashboard_html(
                     "direction": row["direction"],
                     "signal_label": row["signal_label"],
                     "confluence_label": row["confluence_label"],
+                    "core5_alignment": row.get("core5_alignment"),
                     "buy_count": row["buy_count"],
                     "sell_count": row["sell_count"],
                     "zone_label": row.get("zone_label", default_zone_label),
@@ -475,7 +499,16 @@ def render_dashboard_html(
                 })
         payload[pair] = rows
 
+    price_payload: Dict[str, List[Dict[str, Any]]] = {}
+    for pair in PAIRS:
+        row_30s = results.get(pair, {}).get("30s")
+        if mt5_ok and row_30s and isinstance(row_30s.get("price_series"), list):
+            price_payload[pair] = row_30s["price_series"]
+        else:
+            price_payload[pair] = []
+
     data_json = json.dumps(payload, ensure_ascii=False)
+    price_json = json.dumps(price_payload, ensure_ascii=False)
     updated_json = json.dumps(updated_at, ensure_ascii=False)
 
     return f"""<!DOCTYPE html>
@@ -547,12 +580,27 @@ def render_dashboard_html(
     }}
 
     /* B. Barre de sélection des 4 paires */
-    .pairs-bar {{
+    .pairs-row {{
       margin-bottom: 24px;
       display: flex;
       flex-wrap: wrap;
       align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+    .pairs-bar {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
       gap: 10px;
+    }}
+    .live-clock {{
+      font-family: var(--font-mono);
+      font-size: 20px;
+      font-weight: 700;
+      color: #e2e8f0;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
     }}
     .pair-label {{
       display: inline-flex;
@@ -650,6 +698,26 @@ def render_dashboard_html(
       font-size: 24px;
       font-weight: 700;
       color: #ffffff;
+    }}
+    .conf-wrap {{
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }}
+    .core5-dot {{
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }}
+    .core5-dot-buy {{
+      background-color: #10b981;
+      box-shadow: 0 0 8px rgba(16, 185, 129, 0.75);
+    }}
+    .core5-dot-sell {{
+      background-color: #ef4444;
+      box-shadow: 0 0 8px rgba(239, 68, 68, 0.75);
     }}
     .maj-cell {{
       font-family: var(--font-mono);
@@ -755,6 +823,53 @@ def render_dashboard_html(
       color: #f87171;
     }}
 
+    /* D-bis. Panneau Graphique Prix en temps réel */
+    .chart-panel {{
+      margin-top: 24px;
+      border-radius: 12px;
+      border: 1px solid #1e2633;
+      background-color: #0f131a;
+      padding: 20px;
+    }}
+    .chart-price-badge {{
+      font-family: var(--font-mono);
+      font-size: 14px;
+      font-weight: 700;
+      color: #f1f5f9;
+      font-variant-numeric: tabular-nums;
+    }}
+    .chart-container {{
+      position: relative;
+      width: 100%;
+      height: 224px;
+      background: transparent;
+    }}
+    .chart-svg {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      overflow: visible;
+    }}
+    .chart-tooltip {{
+      position: absolute;
+      pointer-events: none;
+      display: none;
+      background-color: #090c11;
+      border: 1px solid #1e2633;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #f1f5f9;
+      white-space: nowrap;
+      z-index: 10;
+    }}
+    .chart-tooltip-time {{
+      color: #94a3b8;
+      margin-bottom: 2px;
+      font-size: 11px;
+    }}
+
     /* E. Pied de page */
     .footer {{
       margin-top: 24px;
@@ -789,7 +904,10 @@ def render_dashboard_html(
   </header>
 
   <main class="main">
-    <div class="pairs-bar" id="pairSelector" role="radiogroup" aria-label="Sélection de la paire Forex"></div>
+    <div class="pairs-row">
+      <div class="pairs-bar" id="pairSelector" role="radiogroup" aria-label="Sélection de la paire Forex"></div>
+      <div class="live-clock" id="liveClock" aria-label="Heure actuelle"></div>
+    </div>
 
     <div class="table-wrap">
       <div class="table-scroll">
@@ -809,6 +927,8 @@ def render_dashboard_html(
 
     <section class="details-panel" id="detailsPanel"></section>
 
+    <section class="chart-panel" id="chartPanel"></section>
+
     <footer class="footer">
       <span class="footer-time" id="footerTime"></span>
       <span id="footerPair"></span>
@@ -817,6 +937,7 @@ def render_dashboard_html(
 
   <script>
     const DATA = {data_json};
+    const PRICE_DATA = {price_json};
     const UPDATED_AT = {updated_json};
     const PAIRS = ["EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm"];
     const STORAGE_PAIR = "forex_agent_selected_pair";
@@ -864,6 +985,16 @@ def render_dashboard_html(
       return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
     }}
 
+    function fmtClockHHMMSS(dateObj) {{
+      return (
+        String(dateObj.getHours()).padStart(2, "0") +
+        ":" +
+        String(dateObj.getMinutes()).padStart(2, "0") +
+        ":" +
+        String(dateObj.getSeconds()).padStart(2, "0")
+      );
+    }}
+
     function setSelectedTfDetail(tf) {{
       selectedTfDetail = tf;
       renderTable();
@@ -887,6 +1018,7 @@ def render_dashboard_html(
           renderPairs();
           renderTable();
           renderDetails();
+          renderChart();
         }});
         lbl.appendChild(inp);
         lbl.appendChild(document.createTextNode(p));
@@ -916,7 +1048,28 @@ def render_dashboard_html(
 
         const tdConf = document.createElement("td");
         tdConf.className = "conf-cell";
-        tdConf.textContent = r.confluence_label;
+        const confWrap = document.createElement("span");
+        confWrap.className = "conf-wrap";
+        const confTextSpan = document.createElement("span");
+        confTextSpan.textContent = r.confluence_label;
+        confWrap.appendChild(confTextSpan);
+
+        let align = r.core5_alignment;
+        if (!align && Array.isArray(r.indicators) && r.indicators.length >= 5) {{
+          const first5 = r.indicators.slice(0, 5);
+          if (first5.every(ind => ind.vote === 1)) align = "ACHAT";
+          else if (first5.every(ind => ind.vote === -1)) align = "VENTE";
+        }}
+        if (r.direction !== "WAIT" && (align === "ACHAT" || align === "VENTE")) {{
+          const dot = document.createElement("span");
+          dot.className = "core5-dot " + (align === "ACHAT" ? "core5-dot-buy" : "core5-dot-sell");
+          dot.title = align === "ACHAT"
+            ? "5/5 alignés ACHAT (EMA, Bollinger, RSI, MACD, Stochastique)"
+            : "5/5 alignés VENTE (EMA, Bollinger, RSI, MACD, Stochastique)";
+          dot.setAttribute("aria-label", dot.title);
+          confWrap.appendChild(dot);
+        }}
+        tdConf.appendChild(confWrap);
 
         const tdMaj = document.createElement("td");
         tdMaj.className = "maj-cell";
@@ -1006,12 +1159,208 @@ def render_dashboard_html(
       panel.appendChild(grid);
     }}
 
+    function renderChart() {{
+      const panel = document.getElementById("chartPanel");
+      const series = PRICE_DATA[selectedPair] || [];
+      if (!Array.isArray(series) || series.length === 0) {{
+        panel.style.display = "none";
+        panel.innerHTML = "";
+        return;
+      }}
+
+      const digits = selectedPair === "USDJPYm" ? 3 : 5;
+      const latest = series[series.length - 1].price;
+      const first = series[0].price;
+      const strokeColor = latest >= first ? "#10b981" : "#ef4444";
+
+      panel.style.display = "block";
+      panel.innerHTML = "";
+
+      const header = document.createElement("div");
+      header.className = "details-header";
+
+      const titleWrap = document.createElement("div");
+      titleWrap.className = "details-title-wrap";
+
+      const title = document.createElement("h3");
+      title.className = "details-title";
+      title.textContent = "Prix en temps réel — " + selectedPair;
+
+      const sub = document.createElement("span");
+      sub.className = "details-zone";
+      sub.textContent = "Bougies 30s (" + series.length + " points)";
+
+      titleWrap.appendChild(title);
+      titleWrap.appendChild(sub);
+
+      const priceBadge = document.createElement("div");
+      priceBadge.className = "chart-price-badge";
+      priceBadge.textContent = latest.toFixed(digits);
+
+      header.appendChild(titleWrap);
+      header.appendChild(priceBadge);
+      panel.appendChild(header);
+
+      const container = document.createElement("div");
+      container.className = "chart-container";
+
+      const W = 1000;
+      const H = 224;
+      const padL = digits === 3 ? 64 : 74;
+      const padR = 14;
+      const padT = 12;
+      const padB = 26;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+
+      let minP = Infinity;
+      let maxP = -Infinity;
+      series.forEach(pt => {{
+        if (pt.price < minP) minP = pt.price;
+        if (pt.price > maxP) maxP = pt.price;
+      }});
+      const span = maxP - minP || (selectedPair === "USDJPYm" ? 0.01 : 0.0001);
+      const minY = minP - span * 0.08;
+      const maxY = maxP + span * 0.08;
+      const spanY = maxY - minY;
+
+      const coords = series.map((pt, idx) => {{
+        const x = padL + (series.length === 1 ? plotW / 2 : (idx / (series.length - 1)) * plotW);
+        const y = padT + (1 - (pt.price - minY) / spanY) * plotH;
+        return {{ x, y, time: pt.time, price: pt.price }};
+      }});
+
+      const svgNS = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(svgNS, "svg");
+      svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+      svg.setAttribute("preserveAspectRatio", "none");
+      svg.className.baseVal = "chart-svg";
+
+      const ySteps = 4;
+      for (let i = 0; i <= ySteps; i++) {{
+        const ratio = i / ySteps;
+        const gy = padT + ratio * plotH;
+        const val = maxY - ratio * spanY;
+
+        const line = document.createElementNS(svgNS, "line");
+        line.setAttribute("x1", String(padL));
+        line.setAttribute("x2", String(W - padR));
+        line.setAttribute("y1", gy.toFixed(1));
+        line.setAttribute("y2", gy.toFixed(1));
+        line.setAttribute("stroke", "#1e2633");
+        line.setAttribute("stroke-dasharray", "3 3");
+        svg.appendChild(line);
+
+        const lbl = document.createElementNS(svgNS, "text");
+        lbl.setAttribute("x", String(padL - 8));
+        lbl.setAttribute("y", (gy + 4).toFixed(1));
+        lbl.setAttribute("text-anchor", "end");
+        lbl.setAttribute("fill", "#94a3b8");
+        lbl.setAttribute("font-size", "11");
+        lbl.setAttribute("font-family", "JetBrains Mono, Consolas, monospace");
+        lbl.textContent = val.toFixed(digits);
+        svg.appendChild(lbl);
+      }}
+
+      const xAxis = document.createElementNS(svgNS, "line");
+      xAxis.setAttribute("x1", String(padL));
+      xAxis.setAttribute("x2", String(W - padR));
+      xAxis.setAttribute("y1", String(H - padB));
+      xAxis.setAttribute("y2", String(H - padB));
+      xAxis.setAttribute("stroke", "#1e2633");
+      svg.appendChild(xAxis);
+
+      const tickCount = Math.min(5, coords.length);
+      for (let t = 0; t < tickCount; t++) {{
+        const idx = tickCount === 1 ? 0 : Math.round((t / (tickCount - 1)) * (coords.length - 1));
+        const pt = coords[idx];
+        const tLbl = document.createElementNS(svgNS, "text");
+        tLbl.setAttribute("x", pt.x.toFixed(1));
+        tLbl.setAttribute("y", String(H - 6));
+        tLbl.setAttribute("text-anchor", t === 0 ? "start" : (t === tickCount - 1 ? "end" : "middle"));
+        tLbl.setAttribute("fill", "#94a3b8");
+        tLbl.setAttribute("font-size", "11");
+        tLbl.setAttribute("font-family", "JetBrains Mono, Consolas, monospace");
+        tLbl.textContent = pt.time || "";
+        svg.appendChild(tLbl);
+      }}
+
+      const poly = document.createElementNS(svgNS, "polyline");
+      poly.setAttribute("fill", "none");
+      poly.setAttribute("stroke", strokeColor);
+      poly.setAttribute("stroke-width", "2");
+      poly.setAttribute("stroke-linejoin", "round");
+      poly.setAttribute("stroke-linecap", "round");
+      poly.setAttribute("points", coords.map(c => c.x.toFixed(1) + "," + c.y.toFixed(1)).join(" "));
+      svg.appendChild(poly);
+
+      const guideLine = document.createElementNS(svgNS, "line");
+      guideLine.setAttribute("y1", String(padT));
+      guideLine.setAttribute("y2", String(H - padB));
+      guideLine.setAttribute("stroke", "#475569");
+      guideLine.setAttribute("stroke-dasharray", "3 3");
+      guideLine.style.display = "none";
+      svg.appendChild(guideLine);
+
+      const activeDot = document.createElementNS(svgNS, "circle");
+      activeDot.setAttribute("r", "4");
+      activeDot.setAttribute("fill", strokeColor);
+      activeDot.setAttribute("stroke", "#0f131a");
+      activeDot.setAttribute("stroke-width", "2");
+      activeDot.style.display = "none";
+      svg.appendChild(activeDot);
+
+      const tooltip = document.createElement("div");
+      tooltip.className = "chart-tooltip";
+
+      svg.addEventListener("mousemove", (evt) => {{
+        const rect = svg.getBoundingClientRect();
+        if (!rect.width) return;
+        const mouseX = ((evt.clientX - rect.left) / rect.width) * W;
+        let nearest = coords[0];
+        let bestDist = Infinity;
+        coords.forEach(c => {{
+          const d = Math.abs(c.x - mouseX);
+          if (d < bestDist) {{
+            bestDist = d;
+            nearest = c;
+          }}
+        }});
+
+        guideLine.setAttribute("x1", nearest.x.toFixed(1));
+        guideLine.setAttribute("x2", nearest.x.toFixed(1));
+        guideLine.style.display = "block";
+        activeDot.setAttribute("cx", nearest.x.toFixed(1));
+        activeDot.setAttribute("cy", nearest.y.toFixed(1));
+        activeDot.style.display = "block";
+
+        tooltip.innerHTML = "<div class='chart-tooltip-time'>" + (nearest.time || "") + "</div><div>" + selectedPair + " : " + nearest.price.toFixed(digits) + "</div>";
+        tooltip.style.display = "block";
+        const leftPct = (nearest.x / W) * 100;
+        tooltip.style.left = Math.min(82, Math.max(4, leftPct)) + "%";
+        tooltip.style.top = "8px";
+      }});
+
+      svg.addEventListener("mouseleave", () => {{
+        guideLine.style.display = "none";
+        activeDot.style.display = "none";
+        tooltip.style.display = "none";
+      }});
+
+      container.appendChild(svg);
+      container.appendChild(tooltip);
+      panel.appendChild(container);
+    }}
+
     renderPairs();
     renderTable();
     renderDetails();
+    renderChart();
+    document.getElementById("liveClock").textContent = fmtClockHHMMSS(new Date());
 
     setInterval(() => {{
       const nowSec = Math.floor(Date.now() / 1000);
+      document.getElementById("liveClock").textContent = fmtClockHHMMSS(new Date(nowSec * 1000));
       document.querySelectorAll("[data-tf]").forEach(el => {{
         const tf = el.dataset.tf;
         const target = getNextTargetSec(tf, nowSec);

@@ -8,6 +8,7 @@ import {
   type TimeframeAnalysis,
 } from './lib/forexEngine';
 import { IndicatorDetailsPanel } from './components/IndicatorDetailsPanel';
+import { PriceChartPanel, type PricePoint } from './components/PriceChartPanel';
 import { PythonExportModal } from './components/PythonExportModal';
 import { type DashboardSettings, SettingsModal } from './components/SettingsModal';
 
@@ -95,11 +96,25 @@ function formatMmSs(totalSeconds: number): string {
   return `${mm}:${ss}`;
 }
 
+function formatClockHHMMSS(date: Date): string {
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mm = String(date.getMinutes()).padStart(2, '0');
+  const ss = String(date.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
 export default function App() {
   const [selectedPair, setSelectedPair] = useState<ForexPair>(readInitialPair);
   const [selectedTfDetail, setSelectedTfDetail] = useState<Timeframe>('1m');
+  const [currentClock, setCurrentClock] = useState<string>(() => formatClockHHMMSS(new Date()));
 
   const [analysisByPair, setAnalysisByPair] = useState<Record<ForexPair, TimeframeAnalysis[]> | null>(null);
+  const [priceHistoryByPair, setPriceHistoryByPair] = useState<Record<ForexPair, PricePoint[]>>({
+    EURUSDm: [],
+    GBPUSDm: [],
+    USDJPYm: [],
+    AUDUSDm: [],
+  });
   const [mt5WaitMode, setMt5WaitMode] = useState<boolean>(false);
   const [lastUpdated, setLastUpdated] = useState<string>('Chargement...');
 
@@ -161,6 +176,25 @@ export default function App() {
           }
           return next;
         });
+        if (data.priceHistoryByPair) {
+          setPriceHistoryByPair(data.priceHistoryByPair as Record<ForexPair, PricePoint[]>);
+        } else {
+          const nowLabel = new Date().toLocaleTimeString('fr-FR', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          });
+          setPriceHistoryByPair((prev) => {
+            const next = { ...prev };
+            for (const pair of PAIRS) {
+              const latestRow = incoming[pair]?.[0];
+              if (latestRow) {
+                next[pair] = [...(prev[pair] || []), { time: nowLabel, price: latestRow.price }].slice(-40);
+              }
+            }
+            return next;
+          });
+        }
         setLastUpdated(data.updatedAt);
       } catch {
         setMt5WaitMode(true);
@@ -185,6 +219,7 @@ export default function App() {
       const nowSec = Math.floor(Date.now() / 1000);
       if (nowSec === lastCheckedSec) return;
       lastCheckedSec = nowSec;
+      setCurrentClock(formatClockHHMMSS(new Date(nowSec * 1000)));
 
       const dueTfs: Timeframe[] = [];
       for (const tf of TIMEFRAMES) {
@@ -288,6 +323,13 @@ export default function App() {
               );
             })}
           </fieldset>
+
+          <div
+            aria-label="Heure actuelle"
+            className="font-mono text-lg sm:text-xl font-bold text-slate-200 tabular-nums"
+          >
+            {currentClock}
+          </div>
         </div>
 
         {/* Bannière d'attente MT5 si injoignable */}
@@ -318,10 +360,18 @@ export default function App() {
                   let signalButtonClass = 'bg-slate-800 text-amber-400';
                   let signalText = 'WAIT';
                   let confluenceText = 'WAIT';
+                  let core5Alignment: 'ACHAT' | 'VENTE' | null = null;
 
                   if (!isWait && row) {
                     signalText = row.signalLabel;
                     confluenceText = row.confluenceLabel;
+                    if (row.core5Alignment === 'ACHAT' || row.core5Alignment === 'VENTE') {
+                      core5Alignment = row.core5Alignment;
+                    } else if (row.indicators.length >= 5) {
+                      const first5 = row.indicators.slice(0, 5);
+                      if (first5.every((ind) => ind.vote === 1)) core5Alignment = 'ACHAT';
+                      else if (first5.every((ind) => ind.vote === -1)) core5Alignment = 'VENTE';
+                    }
                     if (row.direction === 'ACHAT') {
                       signalButtonClass = 'bg-emerald-600 text-white';
                     } else if (row.direction === 'VENTE') {
@@ -350,7 +400,28 @@ export default function App() {
                         </span>
                       </td>
                       <td className="px-6 py-4 font-mono text-xl sm:text-2xl font-bold text-white tabular-nums">
-                        {confluenceText}
+                        <span className="inline-flex items-center gap-2.5">
+                          <span>{confluenceText}</span>
+                          {core5Alignment && (
+                            <span
+                              title={
+                                core5Alignment === 'ACHAT'
+                                  ? '5/5 alignés ACHAT (EMA, Bollinger, RSI, MACD, Stochastique)'
+                                  : '5/5 alignés VENTE (EMA, Bollinger, RSI, MACD, Stochastique)'
+                              }
+                              aria-label={
+                                core5Alignment === 'ACHAT'
+                                  ? 'Alignement ACHAT des 5 indicateurs'
+                                  : 'Alignement VENTE des 5 indicateurs'
+                              }
+                              className={`inline-block h-3 w-3 rounded-full shrink-0 ${
+                                core5Alignment === 'ACHAT'
+                                  ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.75)]'
+                                  : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.75)]'
+                              }`}
+                            />
+                          )}
+                        </span>
                       </td>
                       <td className="px-6 py-4 font-mono text-lg sm:text-xl font-bold text-slate-300 tabular-nums">
                         {formatMmSs(remainingByTf[tf])}
@@ -365,6 +436,13 @@ export default function App() {
 
         {/* Détail des 8 indicateurs + Zone pour la ligne sélectionnée */}
         <IndicatorDetailsPanel analysis={activeDetailAnalysis} />
+
+        {/* Graphique prix en temps réel (Recharts) pour la paire sélectionnée */}
+        <PriceChartPanel
+          pair={selectedPair}
+          data={priceHistoryByPair[selectedPair] || []}
+          isWait={mt5WaitMode}
+        />
 
         {/* Pied de page avec date de dernière mise à jour */}
         <footer className="mt-6 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm text-slate-400">
