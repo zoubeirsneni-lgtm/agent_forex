@@ -7,6 +7,11 @@ interface IndicatorDetailsPanelProps {
 export function IndicatorDetailsPanel({ analysis }: IndicatorDetailsPanelProps) {
   if (!analysis) return null;
 
+  const neutralCount =
+    typeof analysis.neutralCount === 'number'
+      ? analysis.neutralCount
+      : Math.max(0, 8 - analysis.buyCount - analysis.sellCount);
+
   return (
     <section className="mt-6 rounded-xl border border-[#1e2633] bg-[#0f131a] p-5">
       <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2 border-b border-[#1e2633] pb-3">
@@ -19,13 +24,20 @@ export function IndicatorDetailsPanel({ analysis }: IndicatorDetailsPanelProps) 
           </span>
         </div>
         <div className="font-mono text-xs text-slate-300 tabular-nums">
-          Achat : {analysis.buyCount}/8 · Vente : {analysis.sellCount}/8
+          Achat : {analysis.buyCount}/8 · Vente : {analysis.sellCount}/8 · Neutre : {neutralCount}/8
         </div>
       </div>
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {analysis.indicators.map((ind) => {
-          const isBuy = ind.vote === 1;
+          const badgeClass =
+            ind.vote === 1
+              ? 'bg-emerald-500/15 text-emerald-400'
+              : ind.vote === -1
+                ? 'bg-red-500/15 text-red-400'
+                : 'bg-slate-800 text-slate-300';
+          const badgeLabel = ind.vote === 1 ? '+1 ACHAT' : ind.vote === -1 ? '-1 VENTE' : '0 NEUTRE';
+
           return (
             <div
               key={ind.name}
@@ -37,14 +49,8 @@ export function IndicatorDetailsPanel({ analysis }: IndicatorDetailsPanelProps) 
                   {ind.summary}
                 </div>
               </div>
-              <span
-                className={`shrink-0 rounded px-2 py-1 font-mono text-xs font-bold tabular-nums ${
-                  isBuy
-                    ? 'bg-emerald-500/15 text-emerald-400'
-                    : 'bg-red-500/15 text-red-400'
-                }`}
-              >
-                {isBuy ? '+1 ACHAT' : '-1 VENTE'}
+              <span className={`shrink-0 rounded px-2 py-1 font-mono text-xs font-bold tabular-nums ${badgeClass}`}>
+                {badgeLabel}
               </span>
             </div>
           );

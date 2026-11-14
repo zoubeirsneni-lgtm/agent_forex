@@ -7,9 +7,11 @@ import { createServer as createViteServer } from 'vite';
 import {
   analyzeTimeframe,
   type Candle,
+  computeSupportResistance,
   type ForexPair,
   PAIRS,
   type PivotHtf,
+  type SupportResistanceInfo,
   TIMEFRAMES,
   type TimeframeAnalysis,
 } from './src/lib/forexEngine';
@@ -31,6 +33,13 @@ const BASE_SPOT: Record<ForexPair, number> = {
   GBPUSDm: 1.2678,
   USDJPYm: 153.45,
   AUDUSDm: 0.6548,
+};
+
+const BASE_SPREAD_PIPS: Record<ForexPair, number> = {
+  EURUSDm: 0.7,
+  GBPUSDm: 1.0,
+  USDJPYm: 0.8,
+  AUDUSDm: 1.1,
 };
 
 const TF_SECONDS: Record<(typeof TIMEFRAMES)[number], number> = {
@@ -322,6 +331,11 @@ async function startServer() {
       ForexPair,
       { time: string; price: number }[]
     >;
+    const supportResistanceByPair: Record<ForexPair, SupportResistanceInfo> = {} as Record<
+      ForexPair,
+      SupportResistanceInfo
+    >;
+    const spreadByPair: Record<ForexPair, number> = {} as Record<ForexPair, number>;
     for (const pair of PAIRS) {
       const state = marketStore[pair];
       analysisByPair[pair] = targetTfs.map((tf) => {
@@ -345,6 +359,17 @@ async function startServer() {
         }),
         price: c.close,
       }));
+      supportResistanceByPair[pair] = computeSupportResistance(
+        pair,
+        state.spot,
+        state.tfCandles['1m'],
+        state.tfCandles['5m'],
+        state.htfCandles.H1,
+        state.htfCandles.H4
+      );
+      spreadByPair[pair] = Number(
+        Math.max(0.4, BASE_SPREAD_PIPS[pair] + (Math.random() - 0.5) * 0.4).toFixed(1)
+      );
     }
 
     res.json({
@@ -353,6 +378,8 @@ async function startServer() {
       updatedAt,
       analysisByPair,
       priceHistoryByPair,
+      supportResistanceByPair,
+      spreadByPair,
     });
   });
 
