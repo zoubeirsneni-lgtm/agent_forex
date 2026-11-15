@@ -1,10 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Code2, RefreshCw, Settings, Volume2, VolumeX } from 'lucide-react';
+import { Code2, Plus, RefreshCw, Settings, Volume2, VolumeX, X } from 'lucide-react';
 import {
+  computeRiskEstimate,
+  computeUsdStrength,
+  DEFAULT_PAIRS,
   evaluatePairSetup,
   type ForexPair,
-  PAIRS,
+  getForexSessionInfo,
+  getPairDigits,
+  getPineConsensus,
+  getPipSize,
+  isValidTradingSymbol,
+  MAX_ACTIVE_PAIRS,
+  normalizeSymbolInput,
   type PairSetupEvaluation,
+  SUGGESTED_PAIRS,
   type SupportResistanceInfo,
   TIMEFRAMES,
   type Timeframe,
@@ -17,22 +27,48 @@ import { SetupHistoryPanel, type SetupHistoryEntry } from './components/SetupHis
 import { type DashboardSettings, SettingsModal } from './components/SettingsModal';
 import { playSetupChime, unlockAudioContext } from './lib/soundAlert';
 
+const STORAGE_ACTIVE_PAIRS_KEY = 'forex_agent_active_pairs';
 const STORAGE_PAIR_KEY = 'forex_agent_selected_pair';
 const STORAGE_TF_KEY = 'forex_agent_selected_tf';
 const STORAGE_SOUND_KEY = 'forex_agent_sound_enabled';
 const STORAGE_HISTORY_KEY = 'forex_agent_setup_history';
 const STORAGE_SIGS_KEY = 'forex_agent_last_setup_sigs';
 
-function readInitialPair(): ForexPair {
+function readInitialActivePairs(): ForexPair[] {
   try {
-    const saved = localStorage.getItem(STORAGE_PAIR_KEY);
-    if (saved && (PAIRS as readonly string[]).includes(saved)) {
-      return saved as ForexPair;
+    const raw = localStorage.getItem(STORAGE_ACTIVE_PAIRS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const cleaned: ForexPair[] = [];
+        for (const item of parsed) {
+          if (typeof item === 'string') {
+            const sym = normalizeSymbolInput(item);
+            if (sym && isValidTradingSymbol(sym) && !cleaned.includes(sym)) {
+              cleaned.push(sym);
+              if (cleaned.length >= MAX_ACTIVE_PAIRS) break;
+            }
+          }
+        }
+        if (cleaned.length > 0) return cleaned;
+      }
     }
   } catch {
     // ignore storage errors
   }
-  return 'EURUSDm';
+  return [...DEFAULT_PAIRS];
+}
+
+function readInitialPair(activePairs: ForexPair[]): ForexPair {
+  try {
+    const saved = localStorage.getItem(STORAGE_PAIR_KEY);
+    if (saved && activePairs.includes(saved)) {
+      return saved;
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return activePairs[0] || DEFAULT_PAIRS[0];
 }
 
 function readInitialTf(): Timeframe {
@@ -175,20 +211,21 @@ function formatClockHHMMSS(date: Date): string {
 }
 
 export default function App() {
-  const [selectedPair, setSelectedPair] = useState<ForexPair>(readInitialPair);
+  const [activePairs, setActivePairs] = useState<ForexPair[]>(readInitialActivePairs);
+  const [selectedPair, setSelectedPair] = useState<ForexPair>(() =>
+    readInitialPair(readInitialActivePairs())
+  );
   const [selectedTfDetail, setSelectedTfDetail] = useState<Timeframe>(readInitialTf);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(readInitialSound);
   const [setupHistory, setSetupHistory] = useState<SetupHistoryEntry[]>(readInitialHistory);
   const lastSetupSigsRef = useRef<Partial<Record<ForexPair, string>>>(readInitialSigs());
   const [currentClock, setCurrentClock] = useState<string>(() => formatClockHHMMSS(new Date()));
+  const [addPairOpen, setAddPairOpen] = useState<boolean>(false);
+  const [customPairInput, setCustomPairInput] = useState<string>('');
+  const [pairError, setPairError] = useState<string>('');
 
   const [analysisByPair, setAnalysisByPair] = useState<Record<ForexPair, TimeframeAnalysis[]> | null>(null);
-  const [priceHistoryByPair, setPriceHistoryByPair] = useState<Record<ForexPair, PricePoint[]>>({
-    EURUSDm: [],
-    GBPUSDm: [],
-    USDJPYm: [],
-    AUDUSDm: [],
-  });
+  const [priceHistoryByPair, setPriceHistoryByPair] = useState<Record<ForexPair, PricePoint[]>>({});
   const [supportResistanceByPair, setSupportResistanceByPair] = useState<
     Partial<Record<ForexPair, SupportResistanceInfo>>
   >({});
@@ -210,13 +247,79 @@ export default function App() {
     mt5BridgeUrl: 'http://127.0.0.1:8765',
   });
 
+  // Garantir que selectedPair reste toujours valide dans activePairs
+  useEffect(() => {
+    if (!activePairs.includes(selectedPair) && activePairs.length > 0) {
+      const fallback = activePairs[0];
+      setSelectedPair(fallback);
+      try {
+        localStorage.setItem(STORAGE_PAIR_KEY, fallback);
+      } catch {
+        // ignore
+      }
+    }
+  }, [activePairs, selectedPair]);
+
   // Persister le choix de paire
   const handleSelectPair = (pair: ForexPair) => {
+    if (!activePairs.includes(pair)) return;
     setSelectedPair(pair);
     try {
       localStorage.setItem(STORAGE_PAIR_KEY, pair);
     } catch {
       // ignore
+    }
+  };
+
+  const persistActivePairs = (nextPairs: ForexPair[]) => {
+    setActivePairs(nextPairs);
+    try {
+      localStorage.setItem(STORAGE_ACTIVE_PAIRS_KEY, JSON.stringify(nextPairs));
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleAddPair = (rawSymbol: string) => {
+    setPairError('');
+    if (activePairs.length >= MAX_ACTIVE_PAIRS) {
+      setPairError(`Limite atteinte (${MAX_ACTIVE_PAIRS} paires maximum).`);
+      return;
+    }
+    const normalized = normalizeSymbolInput(rawSymbol);
+    if (!normalized || !isValidTradingSymbol(normalized)) {
+      setPairError('Symbole invalide (ex : EURJPYm, USDCADm, XAUUSDm).');
+      return;
+    }
+    if (activePairs.includes(normalized)) {
+      setPairError(`${normalized} est déjà affiché.`);
+      return;
+    }
+    const nextPairs = [...activePairs, normalized];
+    persistActivePairs(nextPairs);
+    setSelectedPair(normalized);
+    try {
+      localStorage.setItem(STORAGE_PAIR_KEY, normalized);
+    } catch {
+      // ignore
+    }
+    setCustomPairInput('');
+    setAddPairOpen(false);
+  };
+
+  const handleRemovePair = (pairToRemove: ForexPair) => {
+    if (activePairs.length <= 1) return;
+    setPairError('');
+    const nextPairs = activePairs.filter((p) => p !== pairToRemove);
+    persistActivePairs(nextPairs);
+    if (selectedPair === pairToRemove && nextPairs.length > 0) {
+      const fallback = nextPairs[0];
+      setSelectedPair(fallback);
+      try {
+        localStorage.setItem(STORAGE_PAIR_KEY, fallback);
+      } catch {
+        // ignore
+      }
     }
   };
 
@@ -260,6 +363,7 @@ export default function App() {
           source: settings.marketSource,
           bridgeUrl: settings.mt5BridgeUrl,
           tfs: tfs.join(','),
+          pairs: activePairs.join(','),
         });
         const res = await fetch(`/api/market-snapshot?${params.toString()}`);
         const data = await res.json();
@@ -274,8 +378,8 @@ export default function App() {
         const incoming = data.analysisByPair as Record<ForexPair, TimeframeAnalysis[]>;
         setAnalysisByPair((prev) => {
           if (!prev) return incoming;
-          const next = { ...prev };
-          for (const pair of PAIRS) {
+          const next: Record<ForexPair, TimeframeAnalysis[]> = {};
+          for (const pair of activePairs) {
             const existingRows = prev[pair] || [];
             const incomingRows = incoming[pair] || [];
             const incomingMap = new Map(incomingRows.map((r) => [r.timeframe, r]));
@@ -296,7 +400,7 @@ export default function App() {
           });
           setPriceHistoryByPair((prev) => {
             const next = { ...prev };
-            for (const pair of PAIRS) {
+            for (const pair of activePairs) {
               const latestRow = incoming[pair]?.[0];
               if (latestRow) {
                 next[pair] = [...(prev[pair] || []), { time: nowLabel, price: latestRow.price }].slice(-40);
@@ -321,7 +425,7 @@ export default function App() {
         if (showSpinner) setIsFetching(false);
       }
     },
-    [settings.marketSource, settings.mt5BridgeUrl]
+    [activePairs, settings.marketSource, settings.mt5BridgeUrl]
   );
 
   // Chargement initial complet des 6 timeframes au démarrage ou changement de source
@@ -375,7 +479,7 @@ export default function App() {
 
   const setupByPair = useMemo(() => {
     const map = {} as Record<ForexPair, PairSetupEvaluation>;
-    for (const pair of PAIRS) {
+    for (const pair of activePairs) {
       if (mt5WaitMode || !analysisByPair) {
         map[pair] = evaluatePairSetup([]);
       } else {
@@ -383,18 +487,21 @@ export default function App() {
       }
     }
     return map;
-  }, [analysisByPair, mt5WaitMode]);
+  }, [activePairs, analysisByPair, mt5WaitMode]);
 
-  // Suivi multi-paires des nouveaux Setups Prêts : historique (max 10) + son optionnel
+  // Suivi multi-paires des nouveaux Setups Prêts : historique (max 10) + résolution 3 bougies + son optionnel
   useEffect(() => {
     if (mt5WaitMode || !analysisByPair) return;
 
     const newEntries: SetupHistoryEntry[] = [];
     let sigsChanged = false;
-    const nowTime = formatClockHHMMSS(new Date());
+    const nowDate = new Date();
+    const nowTime = formatClockHHMMSS(nowDate);
+    const nowSec = Math.floor(nowDate.getTime() / 1000);
 
-    for (const pair of PAIRS) {
+    for (const pair of activePairs) {
       const setup = setupByPair[pair];
+      if (!setup) continue;
       const sig =
         (setup.status === 'READY_BUY' || setup.status === 'READY_SELL') &&
         setup.direction &&
@@ -411,6 +518,9 @@ export default function App() {
         setup.triggerPrice !== null
       ) {
         const rawSpread = spreadByPair[pair];
+        const pairRows = analysisByPair[pair] || [];
+        const triggerRow = pairRows.find((r) => r.timeframe === setup.triggerTf);
+        const pineNote = getPineConsensus(triggerRow?.pineForecast).label;
         newEntries.push({
           id: `${Date.now()}-${pair}-${Math.random().toString(36).slice(2, 6)}`,
           time: nowTime,
@@ -420,6 +530,10 @@ export default function App() {
           price: setup.triggerPrice,
           spreadPips: typeof rawSpread === 'number' ? rawSpread : null,
           srNote: formatSrNote(supportResistanceByPair[pair]),
+          triggeredAtSec: nowSec,
+          pineNote,
+          outcomeStatus: 'PENDING',
+          outcomePips: null,
         });
       }
 
@@ -437,22 +551,53 @@ export default function App() {
       }
     }
 
-    if (newEntries.length > 0) {
-      setSetupHistory((prev) => {
-        const next = [...newEntries, ...prev].slice(0, 10);
-        try {
-          localStorage.setItem(STORAGE_HISTORY_KEY, JSON.stringify(next));
-        } catch {
-          // ignore
+    setSetupHistory((prev) => {
+      let anyResolved = false;
+      const resolvedPrev = prev.map((entry) => {
+        if (
+          (entry.outcomeStatus === 'PENDING' || !entry.outcomeStatus) &&
+          typeof entry.triggeredAtSec === 'number'
+        ) {
+          const horizonSec = entry.timeframe === '1m' ? 180 : 540;
+          if (nowSec - entry.triggeredAtSec >= horizonSec) {
+            const pairRows = analysisByPair[entry.pair] || [];
+            const curPrice = pairRows.find((r) => typeof r.price === 'number' && r.price > 0)?.price;
+            if (typeof curPrice === 'number') {
+              const pip = getPipSize(entry.pair);
+              const rawPips =
+                entry.direction === 'ACHAT'
+                  ? (curPrice - entry.price) / pip
+                  : (entry.price - curPrice) / pip;
+              const roundedPips = Number(rawPips.toFixed(1));
+              anyResolved = true;
+              return {
+                ...entry,
+                outcomeStatus: (roundedPips > 0 ? 'WIN' : 'LOSS') as 'WIN' | 'LOSS',
+                outcomePips: roundedPips,
+              };
+            }
+          }
         }
-        return next;
+        return entry;
       });
 
-      if (soundEnabled) {
-        playSetupChime(newEntries[0].direction);
+      if (newEntries.length === 0 && !anyResolved) {
+        return prev;
       }
+
+      const next = [...newEntries, ...resolvedPrev].slice(0, 10);
+      try {
+        localStorage.setItem(STORAGE_HISTORY_KEY, JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+
+    if (newEntries.length > 0 && soundEnabled) {
+      playSetupChime(newEntries[0].direction);
     }
-  }, [analysisByPair, mt5WaitMode, setupByPair, soundEnabled, spreadByPair, supportResistanceByPair]);
+  }, [activePairs, analysisByPair, mt5WaitMode, setupByPair, soundEnabled, spreadByPair, supportResistanceByPair]);
 
   const currentSpread = useMemo(() => {
     if (mt5WaitMode) return null;
@@ -493,7 +638,41 @@ export default function App() {
     return supportResistanceByPair[selectedPair] ?? null;
   }, [mt5WaitMode, selectedPair, supportResistanceByPair]);
 
-  const srDigits = selectedPair === 'USDJPYm' ? 3 : 5;
+  const srDigits = getPairDigits(selectedPair);
+
+  const minuteKey = currentClock.slice(0, 5);
+  const sessionInfo = useMemo(() => {
+    void minuteKey;
+    return getForexSessionInfo(new Date());
+  }, [minuteKey]);
+
+  const usdStrength = useMemo(() => {
+    if (mt5WaitMode || !analysisByPair) return null;
+    return computeUsdStrength(analysisByPair, activePairs);
+  }, [activePairs, analysisByPair, mt5WaitMode]);
+
+  const riskEstimate = useMemo(() => {
+    if (mt5WaitMode) return null;
+    const setupDir = setupByPair[selectedPair]?.direction;
+    const dirHint = setupDir ?? activeDetailAnalysis?.direction ?? 'NEUTRE';
+    const atrVal = activeDetailAnalysis?.atrValue ?? currentRows[0]?.atrValue;
+    return computeRiskEstimate(selectedPair, atrVal, currentSR, dirHint);
+  }, [activeDetailAnalysis, currentRows, currentSR, mt5WaitMode, selectedPair, setupByPair]);
+
+  const pineConsensus = useMemo(() => {
+    if (mt5WaitMode || !activeDetailAnalysis?.pineForecast) return null;
+    return getPineConsensus(activeDetailAnalysis.pineForecast);
+  }, [activeDetailAnalysis, mt5WaitMode]);
+
+  const sessionWinrate = useMemo(() => {
+    const recent = setupHistory.slice(0, 10);
+    const resolved = recent.filter(
+      (e) => e.outcomeStatus === 'WIN' || e.outcomeStatus === 'LOSS'
+    );
+    const wins = resolved.filter((e) => e.outcomeStatus === 'WIN').length;
+    const pct = resolved.length > 0 ? Math.round((wins / resolved.length) * 100) : null;
+    return { wins, total: resolved.length, pct };
+  }, [setupHistory]);
 
   const srBanner = useMemo(() => {
     if (mt5WaitMode || !currentSR) {
@@ -529,10 +708,34 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#07090d] text-slate-100">
       <header className="border-b border-[#1e2633] bg-[#0a0d13]">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-6 px-5 py-4">
-          <h1 className="text-xl sm:text-2xl font-extrabold tracking-tight text-white whitespace-nowrap shrink-0">
-            Forex Agent Dashboard
-          </h1>
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-5 py-4">
+          <div className="flex flex-wrap items-baseline gap-2.5 min-w-0">
+            <h1 className="text-xl sm:text-2xl font-extrabold tracking-tight text-white whitespace-nowrap shrink-0">
+              Forex Agent Dashboard
+            </h1>
+            <span aria-hidden="true" className="text-slate-600">·</span>
+            <div
+              title="Pourcentage de succès des 10 derniers setups résolus (après 3 bougies)"
+              className="flex items-baseline gap-1.5 whitespace-nowrap shrink-0"
+            >
+              <span className="text-xs sm:text-sm font-medium text-slate-400">
+                Winrate Session
+              </span>
+              <span
+                className={`font-mono text-xs sm:text-sm tabular-nums ${
+                  sessionWinrate.pct === null
+                    ? 'text-slate-400'
+                    : sessionWinrate.pct >= 50
+                      ? 'text-emerald-400 font-semibold'
+                      : 'text-amber-300 font-semibold'
+                }`}
+              >
+                {sessionWinrate.pct !== null
+                  ? `${sessionWinrate.pct}% (${sessionWinrate.wins}/${sessionWinrate.total})`
+                  : '—'}
+              </span>
+            </div>
+          </div>
 
           <div className="flex items-center gap-3 shrink-0">
             <button
@@ -582,55 +785,172 @@ export default function App() {
       </header>
 
       <main className="mx-auto max-w-6xl px-5 py-7">
-        {/* Barre de sélection des 4 paires (boutons radio) */}
-        <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
-          <fieldset aria-label="Sélection de la paire Forex" className="flex flex-wrap items-center gap-2.5">
-            {PAIRS.map((pair) => {
-              const checked = selectedPair === pair;
-              const pairSetup = setupByPair[pair];
-              const isReadyBuy = !mt5WaitMode && pairSetup?.status === 'READY_BUY';
-              const isReadySell = !mt5WaitMode && pairSetup?.status === 'READY_SELL';
-              return (
-                <label
-                  key={pair}
-                  className={`inline-flex items-center gap-2.5 rounded-xl border px-5 py-3 text-sm sm:text-base font-bold transition-colors cursor-pointer select-none ${
-                    checked
-                      ? 'border-emerald-500 bg-emerald-950/50 text-emerald-300'
-                      : 'border-[#1e2633] bg-[#0f131a] text-slate-300 hover:border-slate-600 hover:text-white'
-                  }`}
+        {/* Barre de sélection des paires actives + ajout / suppression */}
+        <div className="mb-6">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <fieldset aria-label="Sélection de la paire Forex" className="flex flex-wrap items-center gap-2.5">
+              {activePairs.map((pair) => {
+                const checked = selectedPair === pair;
+                const pairSetup = setupByPair[pair];
+                const isReadyBuy = !mt5WaitMode && pairSetup?.status === 'READY_BUY';
+                const isReadySell = !mt5WaitMode && pairSetup?.status === 'READY_SELL';
+                const pairTextTone =
+                  usdStrength?.bias === 'HAUSSE'
+                    ? 'text-emerald-400'
+                    : usdStrength?.bias === 'BAISSE'
+                      ? 'text-red-400'
+                      : 'text-white';
+                return (
+                  <div
+                    key={pair}
+                    className={`inline-flex items-center rounded-xl border transition-colors ${
+                      checked
+                        ? 'border-slate-300 bg-[#141b26]'
+                        : 'border-[#1e2633] bg-[#0f131a] hover:border-slate-600'
+                    }`}
+                  >
+                    <label className="inline-flex items-center gap-2.5 px-4 py-3 text-sm sm:text-base font-bold cursor-pointer select-none">
+                      <input
+                        type="radio"
+                        name="forex-pair"
+                        value={pair}
+                        checked={checked}
+                        onChange={() => handleSelectPair(pair)}
+                        className="h-4 w-4 accent-slate-200 cursor-pointer"
+                      />
+                      <span className={`font-mono tracking-tight ${pairTextTone}`}>{pair}</span>
+                      {(isReadyBuy || isReadySell) && (
+                        <>
+                          <span aria-hidden="true" className="text-slate-600">·</span>
+                          <span
+                            className={`text-xs font-semibold whitespace-nowrap ${
+                              isReadyBuy ? 'text-emerald-400' : 'text-red-400'
+                            }`}
+                          >
+                            {isReadyBuy ? 'Prêt ACHAT' : 'Prêt VENTE'}
+                          </span>
+                        </>
+                      )}
+                    </label>
+                    {activePairs.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => handleRemovePair(pair)}
+                        title={`Supprimer ${pair}`}
+                        aria-label={`Supprimer ${pair}`}
+                        className="mr-2 inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-[#1e2633] hover:text-red-400 cursor-pointer shrink-0"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+
+              {activePairs.length < MAX_ACTIVE_PAIRS && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPairError('');
+                    setAddPairOpen((prev) => !prev);
+                  }}
+                  aria-expanded={addPairOpen}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-dashed border-[#2b3648] bg-[#0f131a] px-4 py-3 text-xs sm:text-sm font-semibold text-slate-300 transition-colors hover:border-slate-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Plus className="h-4 w-4" />
+                  Ajouter
+                </button>
+              )}
+            </fieldset>
+
+            <div className="flex flex-wrap items-center gap-3">
+              {usdStrength && (
+                <>
+                  <span
+                    title="Force relative du Dollar US calculée sur les paires USD actives (1m/5m)"
+                    className={`font-mono text-xs sm:text-sm font-semibold tabular-nums whitespace-nowrap ${
+                      usdStrength.bias === 'HAUSSE'
+                        ? 'text-emerald-400'
+                        : usdStrength.bias === 'BAISSE'
+                          ? 'text-red-400'
+                          : 'text-slate-400'
+                    }`}
+                  >
+                    {usdStrength.label} ({usdStrength.score > 0 ? `+${usdStrength.score}` : usdStrength.score}/{usdStrength.maxScore})
+                  </span>
+                  <span aria-hidden="true" className="text-slate-600">
+                    ·
+                  </span>
+                </>
+              )}
+              <div
+                aria-label="Heure actuelle"
+                className="font-mono text-lg sm:text-xl font-bold text-slate-200 tabular-nums"
+              >
+                {currentClock}
+              </div>
+            </div>
+          </div>
+
+          {addPairOpen && (
+            <div className="mt-3 rounded-xl border border-[#1e2633] bg-[#0f131a] p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-medium text-slate-400 mr-1">
+                    Paires suggérées ({activePairs.length}/{MAX_ACTIVE_PAIRS}) :
+                  </span>
+                  {SUGGESTED_PAIRS.filter((s) => !activePairs.includes(s)).map((sym) => (
+                    <button
+                      key={sym}
+                      type="button"
+                      onClick={() => handleAddPair(sym)}
+                      className="rounded-lg border border-[#1e2633] bg-[#090c11] px-2.5 py-1.5 font-mono text-xs font-semibold text-slate-200 transition-colors hover:border-emerald-500/60 hover:text-emerald-300 whitespace-nowrap cursor-pointer"
+                    >
+                      + {sym}
+                    </button>
+                  ))}
+                </div>
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    handleAddPair(customPairInput);
+                  }}
+                  className="flex items-center gap-2"
                 >
                   <input
-                    type="radio"
-                    name="forex-pair"
-                    value={pair}
-                    checked={checked}
-                    onChange={() => handleSelectPair(pair)}
-                    className="h-4 w-4 accent-emerald-500 cursor-pointer"
+                    type="text"
+                    value={customPairInput}
+                    onChange={(e) => {
+                      setCustomPairInput(e.target.value);
+                      if (pairError) setPairError('');
+                    }}
+                    placeholder="Ex: EURJPYm ou XAUUSDm"
+                    aria-label="Nom du symbole personnalisé"
+                    className="w-44 rounded-lg border border-[#1e2633] bg-[#07090d] px-3 py-1.5 font-mono text-xs text-slate-100 placeholder-slate-500 focus:border-emerald-500 focus:outline-none"
                   />
-                  <span className="font-mono tracking-tight">{pair}</span>
-                  {(isReadyBuy || isReadySell) && (
-                    <>
-                      <span aria-hidden="true" className="text-slate-600">·</span>
-                      <span
-                        className={`text-xs font-semibold whitespace-nowrap ${
-                          isReadyBuy ? 'text-emerald-400' : 'text-red-400'
-                        }`}
-                      >
-                        {isReadyBuy ? 'Prêt ACHAT' : 'Prêt VENTE'}
-                      </span>
-                    </>
-                  )}
-                </label>
-              );
-            })}
-          </fieldset>
-
-          <div
-            aria-label="Heure actuelle"
-            className="font-mono text-lg sm:text-xl font-bold text-slate-200 tabular-nums"
-          >
-            {currentClock}
-          </div>
+                  <button
+                    type="submit"
+                    className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 whitespace-nowrap cursor-pointer"
+                  >
+                    Valider
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAddPairOpen(false);
+                      setPairError('');
+                    }}
+                    className="rounded-lg border border-[#1e2633] bg-[#090c11] px-2.5 py-1.5 text-xs font-semibold text-slate-300 hover:border-slate-500 hover:text-white whitespace-nowrap cursor-pointer"
+                  >
+                    Fermer
+                  </button>
+                </form>
+              </div>
+              {pairError && (
+                <p className="mt-2 text-xs font-medium text-amber-300">{pairError}</p>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Bandeau compact Setup 1m/3m, État du marché et Support / Résistance */}
@@ -663,6 +983,18 @@ export default function App() {
                   </span>
                 </>
               )}
+              <span aria-hidden="true" className="text-slate-600">·</span>
+              <span
+                className={`text-xs ${
+                  sessionInfo.tone === 'WARN'
+                    ? 'text-amber-300 font-semibold'
+                    : sessionInfo.tone === 'GOOD'
+                      ? 'text-emerald-400 font-semibold'
+                      : 'text-slate-300'
+                }`}
+              >
+                Session : {sessionInfo.label}
+              </span>
             </div>
           </div>
 
@@ -686,7 +1018,137 @@ export default function App() {
                 <span className="font-mono text-xs text-slate-500">R —</span>
               )}
             </div>
-            <div className={srBanner.alertTone}>{srBanner.alertText}</div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={srBanner.alertTone}>{srBanner.alertText}</span>
+              {riskEstimate && (
+                <>
+                  <span aria-hidden="true" className="text-slate-600">·</span>
+                  <span className="font-mono text-xs text-slate-300 tabular-nums">
+                    SL ~{riskEstimate.slPips.toFixed(1)} pips
+                  </span>
+                  {riskEstimate.rrRatio !== null && (
+                    <>
+                      <span aria-hidden="true" className="text-slate-600">·</span>
+                      <span
+                        className={`font-mono text-xs font-semibold tabular-nums ${
+                          riskEstimate.rrRatio >= 1.5
+                            ? 'text-emerald-400'
+                            : riskEstimate.rrRatio < 1.0
+                              ? 'text-amber-300'
+                              : 'text-slate-300'
+                        }`}
+                      >
+                        R:R ~{riskEstimate.rrRatio.toFixed(1)}x
+                      </span>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="mt-2.5 flex flex-wrap items-center justify-between gap-3 border-t border-[#1a2230] pt-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-slate-400 font-medium">
+                Prévision Pine ({activeDetailAnalysis?.timeframe || selectedTfDetail})
+              </span>
+              <span aria-hidden="true" className="text-slate-600">·</span>
+              {mt5WaitMode || !activeDetailAnalysis?.pineForecast ? (
+                <span className="text-slate-400">En attente des données MT5</span>
+              ) : (
+                (() => {
+                  const pf = activeDetailAnalysis.pineForecast;
+                  const nc = pf.nextCandle;
+                  const bo = pf.breakout;
+                  const ls = pf.levelsStrength;
+
+                  const ncTone =
+                    nc.bias === 'HAUSSE'
+                      ? 'text-emerald-400 font-semibold'
+                      : nc.bias === 'BAISSE'
+                        ? 'text-red-400 font-semibold'
+                        : 'text-slate-300 font-semibold';
+                  const ncDomPct = nc.bias === 'BAISSE' ? nc.shortPct : nc.longPct;
+                  const ncDomLabel =
+                    nc.bias === 'HAUSSE' ? 'Hausse' : nc.bias === 'BAISSE' ? 'Baisse' : 'Neutre';
+                  const ncOppText =
+                    nc.bias === 'BAISSE' ? `${nc.longPct}% ▲` : `${nc.shortPct}% ▼`;
+
+                  const boTone =
+                    bo.bias === 'HAUSSE'
+                      ? 'text-emerald-400 font-semibold'
+                      : bo.bias === 'BAISSE'
+                        ? 'text-red-400 font-semibold'
+                        : 'text-slate-300 font-semibold';
+
+                  const lsTone =
+                    ls.bias === 'HAUSSE'
+                      ? 'text-emerald-400 font-semibold'
+                      : ls.bias === 'BAISSE'
+                        ? 'text-red-400 font-semibold'
+                        : 'text-slate-300 font-semibold';
+                  const lsDomPct = ls.bias === 'BAISSE' ? ls.bearPct : ls.bullPct;
+                  const lsDomLabel =
+                    ls.bias === 'HAUSSE' ? 'Hausse' : ls.bias === 'BAISSE' ? 'Baisse' : 'Neutre';
+                  const lsOppText =
+                    ls.bias === 'BAISSE' ? `${ls.bullPct}% ▲` : `${ls.bearPct}% ▼`;
+
+                  return (
+                    <>
+                      <span className="text-slate-400">Next Candle :</span>
+                      <span className={`font-mono text-xs sm:text-sm tabular-nums ${ncTone}`}>
+                        {ncDomPct}% {ncDomLabel}
+                      </span>
+                      <span className="font-mono text-xs text-slate-400 tabular-nums">
+                        ({ncOppText}{nc.strongSetup ? ' · Fort' : ''})
+                      </span>
+
+                      <span aria-hidden="true" className="text-slate-600">·</span>
+
+                      <span className="text-slate-400">Breakout :</span>
+                      <span className={`font-mono text-xs sm:text-sm tabular-nums ${boTone}`}>
+                        {bo.upPct.toFixed(1)}% ▲ / {bo.dnPct.toFixed(1)}% ▼
+                      </span>
+                      {bo.winRate !== null && (
+                        <span className="font-mono text-xs text-slate-400 tabular-nums">
+                          (WR {bo.winRate.toFixed(0)}%)
+                        </span>
+                      )}
+
+                      <span aria-hidden="true" className="text-slate-600">·</span>
+
+                      <span className="text-slate-400">Levels :</span>
+                      <span className={`font-mono text-xs sm:text-sm tabular-nums ${lsTone}`}>
+                        {lsDomPct}% {lsDomLabel}
+                      </span>
+                      <span className="font-mono text-xs text-slate-400 tabular-nums">
+                        ({lsOppText})
+                      </span>
+                    </>
+                  );
+                })()
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              {pineConsensus && (
+                <>
+                  <span className="text-slate-400">Accord Pine :</span>
+                  <span
+                    className={`font-mono font-semibold tabular-nums ${
+                      pineConsensus.bias === 'HAUSSE'
+                        ? 'text-emerald-400'
+                        : pineConsensus.bias === 'BAISSE'
+                          ? 'text-red-400'
+                          : 'text-slate-300'
+                    }`}
+                  >
+                    {pineConsensus.label}
+                  </span>
+                  <span aria-hidden="true" className="text-slate-600">·</span>
+                </>
+              )}
+              <span className="text-slate-500">Informatif</span>
+            </div>
           </div>
         </div>
 

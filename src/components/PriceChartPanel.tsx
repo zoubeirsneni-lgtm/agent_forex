@@ -8,7 +8,12 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import type { ForexPair, SupportResistanceInfo } from '../lib/forexEngine';
+import {
+  type ForexPair,
+  getPairDigits,
+  getPipSize,
+  type SupportResistanceInfo,
+} from '../lib/forexEngine';
 
 export interface PricePoint {
   time: string;
@@ -30,8 +35,8 @@ export function PriceChartPanel({
 }: PriceChartPanelProps) {
   if (isWait || data.length === 0) return null;
 
-  const digits = pair === 'USDJPYm' ? 3 : 5;
-  const pip = pair === 'USDJPYm' ? 0.01 : 0.0001;
+  const digits = getPairDigits(pair);
+  const pip = getPipSize(pair);
   const latestPrice = data[data.length - 1]?.price;
   const firstPrice = data[0]?.price;
   const isUp = latestPrice !== undefined && firstPrice !== undefined ? latestPrice >= firstPrice : true;
@@ -114,7 +119,7 @@ export function PriceChartPanel({
               tick={{ fill: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
               tickLine={false}
               axisLine={false}
-              width={digits === 3 ? 62 : 70}
+              width={digits <= 3 ? 62 : 70}
               tickFormatter={(val: number) => val.toFixed(digits)}
             />
             <Tooltip

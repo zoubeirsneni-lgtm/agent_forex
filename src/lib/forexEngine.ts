@@ -1,5 +1,68 @@
-export const PAIRS = ['EURUSDm', 'GBPUSDm', 'USDJPYm', 'AUDUSDm'] as const;
-export type ForexPair = (typeof PAIRS)[number];
+import {
+  computePineForecast,
+  getPineConsensus,
+  type PineConsensusInfo,
+  type PineForecastBias,
+  type PineForecastInfo,
+} from './pineForecast';
+
+export {
+  getPineConsensus,
+  type PineConsensusInfo,
+  type PineForecastBias,
+  type PineForecastInfo,
+};
+
+export const DEFAULT_PAIRS = ['EURUSDm', 'GBPUSDm', 'USDJPYm', 'AUDUSDm'] as const;
+export const PAIRS = DEFAULT_PAIRS;
+export type ForexPair = string;
+
+export const SUGGESTED_PAIRS = [
+  'EURUSDm',
+  'GBPUSDm',
+  'USDJPYm',
+  'AUDUSDm',
+  'USDCADm',
+  'USDCHFm',
+  'NZDUSDm',
+  'EURJPYm',
+  'GBPJPYm',
+  'EURGBPm',
+  'AUDJPYm',
+  'XAUUSDm',
+] as const;
+
+export const MAX_ACTIVE_PAIRS = 8;
+
+export function normalizeSymbolInput(raw: string): string {
+  const cleaned = raw.trim().replace(/\s+/g, '');
+  if (!cleaned) return '';
+  if (/^[A-Za-z]{6}$/.test(cleaned)) {
+    return `${cleaned.toUpperCase()}m`;
+  }
+  if (/^[A-Za-z]{6}[mM]$/.test(cleaned)) {
+    return `${cleaned.slice(0, 6).toUpperCase()}m`;
+  }
+  return cleaned.slice(0, 16);
+}
+
+export function isValidTradingSymbol(symbol: string): boolean {
+  return /^[A-Za-z0-9._-]{3,16}$/.test(symbol);
+}
+
+export function getPipSize(pair: string): number {
+  const upper = pair.toUpperCase();
+  if (upper.includes('XAU') || upper.includes('GOLD')) return 0.1;
+  if (upper.includes('JPY')) return 0.01;
+  return 0.0001;
+}
+
+export function getPairDigits(pair: string): number {
+  const upper = pair.toUpperCase();
+  if (upper.includes('XAU') || upper.includes('GOLD')) return 2;
+  if (upper.includes('JPY')) return 3;
+  return 5;
+}
 
 export const TIMEFRAMES = ['30s', '1m', '3m', '5m', '10m', '15m'] as const;
 export type Timeframe = (typeof TIMEFRAMES)[number];
@@ -181,9 +244,11 @@ export interface TimeframeAnalysis {
   confluence: number;
   confluenceLabel: string;
   core5Alignment: 'ACHAT' | 'VENTE' | null;
+  atrValue?: number;
   atrRatio: number;
   volRatio: number;
   indicators: IndicatorResult[];
+  pineForecast?: PineForecastInfo;
 }
 
 // --- Technical Indicator Math ---
@@ -322,7 +387,7 @@ export function analyzeTimeframe(
   const volumes = candles.map((c) => c.tickVolume);
   const current = candles[candles.length - 1];
   const prev = candles[candles.length - 2] ?? current;
-  const digits = pair === 'USDJPYm' ? 3 : 5;
+  const digits = getPairDigits(pair);
   const isEntryTf = timeframe === '30s' || timeframe === '1m' || timeframe === '3m';
 
   // 1. EMA: +1 if emaShort > emaLong, -1 if <, 0 if equal
@@ -500,9 +565,11 @@ export function analyzeTimeframe(
     confluence,
     confluenceLabel: `${confluence}/8`,
     core5Alignment,
+    atrValue: atrNow,
     atrRatio,
     volRatio,
     indicators,
+    pineForecast: computePineForecast(candles),
   };
 }
 
@@ -570,7 +637,7 @@ export function computeSupportResistance(
   h1Candle: { high: number; low: number; close: number },
   h4Candle: { high: number; low: number; close: number }
 ): SupportResistanceInfo {
-  const pip = pair === 'USDJPYm' ? 0.01 : 0.0001;
+  const pip = getPipSize(pair);
   const candidates: { price: number; source: string }[] = [];
 
   for (const s of collectSwingCandidates(candles1m, '1m', 80)) {
@@ -764,6 +831,124 @@ export function evaluatePairSetup(rows: TimeframeAnalysis[]): PairSetupEvaluatio
     volRatio,
     isMarketActive,
   };
+}
+
+export interface ForexSessionInfo {
+  label: string;
+  tone: 'GOOD' | 'NORMAL' | 'WARN';
+}
+
+export function getForexSessionInfo(date: Date = new Date()): ForexSessionInfo {
+  const day = date.getUTCDay(); // 0=Sun, 5=Fri, 6=Sat
+  const mins = date.getUTCHours() * 60 + date.getUTCMinutes();
+
+  if (day === 6 || (day === 5 && mins >= 22 * 60) || (day === 0 && mins < 22 * 60)) {
+    return { label: 'Marché fermé · Week-end', tone: 'WARN' };
+  }
+  if (mins >= 21 * 60 + 55 && mins <= 23 * 60 + 5) {
+    return { label: 'Rollover · Spread élevé', tone: 'WARN' };
+  }
+  if (mins >= 12 * 60 && mins < 16 * 60) {
+    return { label: 'Londres + New York · Liquidité optimale', tone: 'GOOD' };
+  }
+  if (mins >= 7 * 60 && mins < 12 * 60) {
+    return { label: 'Londres', tone: 'NORMAL' };
+  }
+  if (mins >= 16 * 60 && mins < 21 * 60 + 55) {
+    return { label: 'New York', tone: 'NORMAL' };
+  }
+  return { label: 'Asie', tone: 'NORMAL' };
+}
+
+export interface UsdStrengthInfo {
+  score: number;
+  maxScore: number;
+  label: 'USD Fort' | 'USD Faible' | 'USD Neutre';
+  bias: 'HAUSSE' | 'BAISSE' | 'NEUTRE';
+}
+
+export function computeUsdStrength(
+  analysisByPair: Partial<Record<ForexPair, TimeframeAnalysis[]>> | null | undefined,
+  activePairs?: readonly ForexPair[]
+): UsdStrengthInfo | null {
+  if (!analysisByPair) return null;
+  const targetPairs =
+    activePairs && activePairs.length > 0 ? activePairs : Object.keys(analysisByPair);
+  let score = 0;
+  let validPairs = 0;
+
+  for (const pair of targetPairs) {
+    const clean = pair.replace(/m$/i, '').toUpperCase();
+    if (clean.includes('XAU') || clean.includes('GOLD') || !clean.includes('USD')) {
+      continue;
+    }
+    const isUsdBase = clean.startsWith('USD');
+    const isUsdQuote = clean.endsWith('USD');
+    if (!isUsdBase && !isUsdQuote) continue;
+
+    const rows = analysisByPair[pair];
+    if (!rows || rows.length === 0) continue;
+    const r1m = rows.find((r) => r.timeframe === '1m');
+    const r5m = rows.find((r) => r.timeframe === '5m');
+    const sample = [r1m, r5m].filter((r): r is TimeframeAnalysis => Boolean(r));
+    const refs = sample.length > 0 ? sample : [rows[0]];
+    const avgNet =
+      refs.reduce((acc, r) => acc + (r.buyCount - r.sellCount), 0) / refs.length;
+    const pairBias = avgNet >= 1.5 ? 1 : avgNet <= -1.5 ? -1 : 0;
+    const usdDelta = isUsdBase ? pairBias : -pairBias;
+    score += usdDelta;
+    validPairs += 1;
+  }
+
+  if (validPairs === 0) return null;
+
+  const threshold = validPairs >= 4 ? 2 : 1;
+  if (score >= threshold) {
+    return { score, maxScore: validPairs, label: 'USD Fort', bias: 'HAUSSE' };
+  }
+  if (score <= -threshold) {
+    return { score, maxScore: validPairs, label: 'USD Faible', bias: 'BAISSE' };
+  }
+  return { score, maxScore: validPairs, label: 'USD Neutre', bias: 'NEUTRE' };
+}
+
+export interface RiskEstimateInfo {
+  slPips: number;
+  rrRatio: number | null;
+}
+
+export function computeRiskEstimate(
+  pair: ForexPair,
+  atrValue: number | undefined,
+  sr: SupportResistanceInfo | null | undefined,
+  directionHint: SignalDirection
+): RiskEstimateInfo | null {
+  if (typeof atrValue !== 'number' || !Number.isFinite(atrValue) || atrValue <= 0) {
+    return null;
+  }
+  const pip = getPipSize(pair);
+  const slPips = Number(((1.5 * atrValue) / pip).toFixed(1));
+  if (slPips <= 0) return null;
+
+  let obstaclePips: number | null = null;
+  if (directionHint === 'ACHAT' && sr?.resistance) {
+    obstaclePips = sr.resistance.distancePips;
+  } else if (directionHint === 'VENTE' && sr?.support) {
+    obstaclePips = sr.support.distancePips;
+  } else if (sr?.support && sr?.resistance) {
+    obstaclePips = Math.min(sr.support.distancePips, sr.resistance.distancePips);
+  } else if (sr?.resistance) {
+    obstaclePips = sr.resistance.distancePips;
+  } else if (sr?.support) {
+    obstaclePips = sr.support.distancePips;
+  }
+
+  const rrRatio =
+    obstaclePips !== null && Number.isFinite(obstaclePips) && obstaclePips > 0
+      ? Number((obstaclePips / slPips).toFixed(1))
+      : null;
+
+  return { slPips, rrRatio };
 }
 
 

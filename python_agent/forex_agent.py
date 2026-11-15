@@ -2,17 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 Forex Agent Dashboard - Agent autonome Windows 10 + MetaTrader 5 (Exness-MT5Trial16)
-Surveillance temps réel de 4 paires (EURUSDm, GBPUSDm, USDJPYm, AUDUSDm)
+Surveillance temps réel de paires Forex et Or (dynamiques, jusqu'à 8 paires)
 sur 6 timeframes (30s, 1m, 3m, 5m, 10m, 15m) avec 8 indicateurs techniques.
 """
 
 import json
 import os
+import re
 import signal
 import sys
+import threading
 import time
 import webbrowser
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,10 +33,91 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 DASHBOARD_DIR = BASE_DIR / "dashboard"
 DASHBOARD_HTML_PATH = DASHBOARD_DIR / "forex_dashboard.html"
+PAIRS_CONFIG_PATH = DASHBOARD_DIR / "pairs_config.json"
 
 MT5_SERVER = "Exness-MT5Trial16"
-PAIRS = ["EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm"]
+DEFAULT_PAIRS = ["EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm"]
+SUGGESTED_PAIRS = [
+    "EURUSDm",
+    "GBPUSDm",
+    "USDJPYm",
+    "AUDUSDm",
+    "USDCADm",
+    "USDCHFm",
+    "NZDUSDm",
+    "EURJPYm",
+    "GBPJPYm",
+    "EURGBPm",
+    "AUDJPYm",
+    "XAUUSDm",
+]
+MAX_ACTIVE_PAIRS = 8
+HTTP_PORT_START = 8765
+HTTP_PORT_END = 8775
 TIMEFRAMES = ["30s", "1m", "3m", "5m", "10m", "15m"]
+
+
+def normalize_symbol(raw: str) -> str:
+    cleaned = re.sub(r"\s+", "", str(raw or "").strip())
+    if not cleaned:
+        return ""
+    if re.fullmatch(r"[A-Za-z]{6}", cleaned):
+        return cleaned.upper() + "m"
+    if re.fullmatch(r"[A-Za-z]{6}[mM]", cleaned):
+        return cleaned[:6].upper() + "m"
+    return cleaned[:16]
+
+
+def is_valid_trading_symbol(symbol: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9._-]{3,16}", symbol))
+
+
+def get_pip_size(symbol: str) -> float:
+    upper = symbol.upper()
+    if "XAU" in upper or "GOLD" in upper:
+        return 0.1
+    if "JPY" in upper:
+        return 0.01
+    return 0.0001
+
+
+def get_digits(symbol: str) -> int:
+    upper = symbol.upper()
+    if "XAU" in upper or "GOLD" in upper:
+        return 2
+    if "JPY" in upper:
+        return 3
+    return 5
+
+
+def load_pairs_config() -> List[str]:
+    try:
+        if PAIRS_CONFIG_PATH.exists():
+            raw = json.loads(PAIRS_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                cleaned: List[str] = []
+                for item in raw:
+                    if isinstance(item, str):
+                        sym = normalize_symbol(item)
+                        if sym and is_valid_trading_symbol(sym) and sym not in cleaned:
+                            cleaned.append(sym)
+                            if len(cleaned) >= MAX_ACTIVE_PAIRS:
+                                break
+                if cleaned:
+                    return cleaned
+    except Exception as exc:
+        print(f"[INFO] Lecture pairs_config.json ignorée : {exc}")
+    return list(DEFAULT_PAIRS)
+
+
+def save_pairs_config(pairs: List[str]) -> None:
+    DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = DASHBOARD_DIR / "pairs_config.tmp.json"
+    tmp_path.write_text(json.dumps(pairs, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, PAIRS_CONFIG_PATH)
+
+
+PAIRS = load_pairs_config()
 
 # Paramètres stricts par zone
 ZONES: Dict[str, Dict[str, Any]] = {
@@ -106,12 +190,27 @@ ZONES: Dict[str, Dict[str, Any]] = {
 }
 
 RUNNING = True
+STATE_LOCK = threading.Lock()
+ACTIVE_PAIRS: List[str] = list(PAIRS)
+LATEST_RESULTS: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {p: {} for p in ACTIVE_PAIRS}
+LATEST_SR: Dict[str, Optional[Dict[str, Any]]] = {p: None for p in ACTIVE_PAIRS}
+LATEST_SPREAD: Dict[str, Optional[float]] = {p: None for p in ACTIVE_PAIRS}
+LATEST_MT5_OK: bool = False
+LATEST_UPDATED_AT: str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+LATEST_HTML: str = ""
+HTTP_SERVER: Optional[ThreadingHTTPServer] = None
 
 
 def handle_sigint(signum, frame):
     global RUNNING
     RUNNING = False
     print("\n[ARRET] Interruption Ctrl+C détectée. Fermeture propre de MetaTrader 5...")
+    if HTTP_SERVER is not None:
+        try:
+            HTTP_SERVER.shutdown()
+            HTTP_SERVER.server_close()
+        except Exception:
+            pass
     if mt5 is not None:
         try:
             mt5.shutdown()
@@ -127,20 +226,20 @@ signal.signal(signal.SIGTERM, handle_sigint)
 # ==============================================================================
 # CONNEXION & DONNÉES MT5
 # ==============================================================================
-def ensure_mt5_connected() -> bool:
+def ensure_mt5_connected(pairs_list: Optional[List[str]] = None) -> bool:
     if mt5 is None:
         return False
     info = mt5.terminal_info()
-    if info is not None and mt5.account_info() is not None:
-        return True
-    if not mt5.initialize():
-        return False
-    acct = mt5.account_info()
-    if acct is None:
-        return False
-    if acct.server != MT5_SERVER:
-        print(f"[INFO] Serveur MT5 actif : {acct.server} (attendu : {MT5_SERVER})")
-    for sym in PAIRS:
+    if info is None or mt5.account_info() is None:
+        if not mt5.initialize():
+            return False
+        acct = mt5.account_info()
+        if acct is None:
+            return False
+        if acct.server != MT5_SERVER:
+            print(f"[INFO] Serveur MT5 actif : {acct.server} (attendu : {MT5_SERVER})")
+    target_pairs = pairs_list if pairs_list is not None else ACTIVE_PAIRS
+    for sym in target_pairs:
         mt5.symbol_select(sym, True)
     return True
 
@@ -229,6 +328,321 @@ def compute_atr_stats(df: pd.DataFrame, period: int) -> Tuple[float, float]:
     return atr_now, atr_ratio
 
 
+def _pf_ema(values: List[float], period: int) -> List[float]:
+    n = len(values)
+    if n == 0:
+        return []
+    k = 2.0 / (period + 1)
+    out = [0.0] * n
+    seed_len = min(period, n)
+    ema = sum(values[:seed_len]) / seed_len
+    for i in range(seed_len):
+        out[i] = ema
+    for i in range(seed_len, n):
+        ema = values[i] * k + ema * (1.0 - k)
+        out[i] = ema
+    return out
+
+
+def _pf_rma(values: List[float], period: int) -> List[float]:
+    n = len(values)
+    if n == 0:
+        return []
+    out = [0.0] * n
+    seed_len = min(period, n)
+    acc = 0.0
+    for i in range(seed_len):
+        acc += values[i]
+        out[i] = acc / (i + 1)
+    rma = out[seed_len - 1]
+    for i in range(seed_len, n):
+        rma = (rma * (period - 1) + values[i]) / period
+        out[i] = rma
+    return out
+
+
+def _pf_sma(values: List[float], period: int) -> List[float]:
+    n = len(values)
+    if n == 0:
+        return []
+    out = [0.0] * n
+    running = 0.0
+    for i in range(n):
+        running += values[i]
+        if i >= period:
+            running -= values[i - period]
+        cnt = min(i + 1, period)
+        out[i] = running / cnt
+    return out
+
+
+def _pf_rsi_last(closes: List[float], period: int) -> float:
+    n = len(closes)
+    if n < 2:
+        return 50.0
+    gains = [0.0] * (n - 1)
+    losses = [0.0] * (n - 1)
+    for i in range(1, n):
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+            gains[i - 1] = diff
+        elif diff < 0:
+            losses[i - 1] = -diff
+    avg_gain = _pf_rma(gains, period)[-1]
+    avg_loss = _pf_rma(losses, period)[-1]
+    if avg_loss == 0.0:
+        return 50.0 if avg_gain == 0.0 else 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def compute_pine_forecast(df: pd.DataFrame) -> Dict[str, Any]:
+    opens = df["open"].astype(float).tolist()
+    highs = df["high"].astype(float).tolist()
+    lows = df["low"].astype(float).tolist()
+    closes = df["close"].astype(float).tolist()
+    vols = df["tick_volume"].astype(float).tolist()
+    n = len(closes)
+
+    # 1. Next Candle Predictor V4.1
+    if n < 5:
+        nc_res = {"longPct": 50, "shortPct": 50, "bias": "NEUTRE", "strongSetup": False}
+    else:
+        tr = [highs[0] - lows[0]]
+        for i in range(1, n):
+            pc = closes[i - 1]
+            tr.append(max(highs[i] - lows[i], abs(highs[i] - pc), abs(lows[i] - pc)))
+
+        trend_atr = _pf_rma(tr, 10)
+        upper_band = 0.0
+        lower_band = 0.0
+        trend_dir = 1
+        for i in range(n):
+            hl2 = (highs[i] + lows[i]) / 2.0
+            upper_raw = hl2 + 3.0 * trend_atr[i]
+            lower_raw = hl2 - 3.0 * trend_atr[i]
+            if i == 0:
+                upper_band = upper_raw
+                lower_band = lower_raw
+                trend_dir = 1
+            else:
+                prev_c = closes[i - 1]
+                prev_u = upper_band
+                prev_l = lower_band
+                prev_d = trend_dir
+                lower_band = max(lower_raw, prev_l) if prev_c > prev_l else lower_raw
+                upper_band = min(upper_raw, prev_u) if prev_c < prev_u else upper_raw
+                if prev_d == -1:
+                    trend_dir = 1 if closes[i] < lower_band else -1
+                else:
+                    trend_dir = -1 if closes[i] > upper_band else 1
+
+        is_up = trend_dir == -1
+        is_dn = trend_dir == 1
+
+        vol_deltas = []
+        for i in range(n):
+            rng = highs[i] - lows[i]
+            buy_v = (vols[i] * (closes[i] - lows[i]) / rng) if rng > 0 else vols[i] * 0.5
+            sell_v = (vols[i] * (highs[i] - closes[i]) / rng) if rng > 0 else vols[i] * 0.5
+            vol_deltas.append(buy_v - sell_v)
+        delta_ema = _pf_ema(vol_deltas, 10)[-1]
+        vol_delta = vol_deltas[-1]
+        delta_mom = vol_delta > delta_ema
+        delta_bull = vol_delta > 0
+        delta_bear = vol_delta < 0
+
+        atr_series = _pf_rma(tr, 14)
+        atr_now = atr_series[-1]
+        ema8 = _pf_ema(closes, 8)[-1]
+        ema21 = _pf_ema(closes, 21)[-1]
+        ema50 = _pf_ema(closes, 50)[-1]
+        rsi_val = _pf_rsi_last(closes, 14)
+
+        ema12_s = _pf_ema(closes, 12)
+        ema26_s = _pf_ema(closes, 26)
+        macd_s = [ema12_s[i] - ema26_s[i] for i in range(n)]
+        sig_s = _pf_ema(macd_s, 9)
+        macd_line = macd_s[-1]
+        sig_line = sig_s[-1]
+        macd_hist = macd_line - sig_line
+
+        stoch_raw = []
+        for i in range(n):
+            s_idx = max(0, i - 13)
+            hi = max(highs[s_idx:i + 1])
+            lo = min(lows[s_idx:i + 1])
+            span = hi - lo
+            stoch_raw.append(((closes[i] - lo) / span) * 100.0 if span > 0 else 50.0)
+        stoch_k = stoch_raw[-1]
+        stoch_d = _pf_sma(stoch_raw, 3)[-1]
+
+        vol_sma = _pf_sma(vols, 20)[-1]
+        vol_ratio = (vols[-1] / vol_sma) if vol_sma > 0 else 1.0
+
+        plus_dm = [0.0] * n
+        minus_dm = [0.0] * n
+        for i in range(1, n):
+            up_m = highs[i] - highs[i - 1]
+            dn_m = lows[i - 1] - lows[i]
+            plus_dm[i] = up_m if (up_m > dn_m and up_m > 0) else 0.0
+            minus_dm[i] = dn_m if (dn_m > up_m and dn_m > 0) else 0.0
+        plus_rma = _pf_rma(plus_dm, 14)
+        minus_rma = _pf_rma(minus_dm, 14)
+        dx_series = []
+        for i in range(n):
+            t_val = atr_series[i]
+            di_p = (100.0 * plus_rma[i] / t_val) if t_val > 0 else 0.0
+            di_m = (100.0 * minus_rma[i] / t_val) if t_val > 0 else 0.0
+            denom = di_p + di_m
+            dx_series.append((100.0 * abs(di_p - di_m) / denom) if denom > 0 else 0.0)
+        adx_val = _pf_rma(dx_series, 14)[-1]
+
+        end_idx = n - 2
+        start_idx = max(0, end_idx - 99)
+        cnt_pct = end_idx - start_idx + 1
+        le_cnt = sum(1 for i in range(start_idx, end_idx + 1) if atr_series[i] <= atr_now)
+        atr_pct = (le_cnt / cnt_pct) * 100.0 if cnt_pct > 0 else 50.0
+        vol_mult = 0.85 if atr_pct > 75 else (1.15 if atr_pct < 25 else 1.0)
+        dyn_thresh = 55 if adx_val > 30 else (60 if adx_val > 25 else (65 if adx_val > 20 else 70))
+
+        macd_l = 100 if (macd_line > sig_line and macd_hist > 0) else (70 if macd_line > sig_line else (50 if macd_hist > 0 else 20))
+        macd_s_sc = 100 if (macd_line < sig_line and macd_hist < 0) else (70 if macd_line < sig_line else (50 if macd_hist < 0 else 20))
+
+        rsi_l = 100 if rsi_val < 30 else (85 if rsi_val < 40 else (70 if rsi_val < 50 else (50 if rsi_val < 60 else 25)))
+        rsi_s_sc = 100 if rsi_val > 70 else (85 if rsi_val > 60 else (70 if rsi_val > 50 else (50 if rsi_val > 40 else 25)))
+
+        stoch_l = 100 if (stoch_k > stoch_d and stoch_k < 20) else (85 if (stoch_k > stoch_d and stoch_k < 50) else (65 if stoch_k > stoch_d else 25))
+        stoch_s_sc = 100 if (stoch_k < stoch_d and stoch_k > 80) else (85 if (stoch_k < stoch_d and stoch_k > 50) else (65 if stoch_k < stoch_d else 25))
+
+        vol_sc = 100 if vol_ratio > 2.0 else (80 if vol_ratio > 1.5 else (60 if vol_ratio > 1.0 else (45 if vol_ratio > 0.8 else 25)))
+        delta_l = 100 if (vol_delta > 0 and delta_mom) else (75 if vol_delta > 0 else (40 if vol_delta > -abs(delta_ema) else 20))
+        delta_s_sc = 100 if (vol_delta < 0 and not delta_mom) else (75 if vol_delta < 0 else (40 if vol_delta < abs(delta_ema) else 20))
+        adx_sc = 100 if adx_val > 35 else (85 if adx_val > 30 else (70 if adx_val > 25 else (50 if adx_val > 20 else 30)))
+
+        trend_l = 100 if (is_up and ema8 > ema21 and ema21 > ema50) else (80 if (is_up and ema8 > ema21) else (60 if is_up else 0))
+        trend_s_sc = 100 if (is_dn and ema8 < ema21 and ema21 < ema50) else (80 if (is_dn and ema8 < ema21) else (60 if is_dn else 0))
+
+        l_raw = trend_l * 0.23 + macd_l * 0.18 + delta_l * 0.15 + rsi_l * 0.12 + stoch_l * 0.12 + adx_sc * 0.1 + vol_sc * 0.1
+        s_raw = trend_s_sc * 0.23 + macd_s_sc * 0.18 + delta_s_sc * 0.15 + rsi_s_sc * 0.12 + stoch_s_sc * 0.12 + adx_sc * 0.1 + vol_sc * 0.1
+
+        l_score = round(min(100.0, max(0.0, l_raw * vol_mult)))
+        s_score = round(min(100.0, max(0.0, s_raw * vol_mult)))
+        tot = l_score + s_score
+        long_pct = round((l_score / tot) * 100.0) if tot > 0 else 50
+        short_pct = 100 - long_pct
+
+        conf_l = sum([
+            1 if is_up else 0,
+            1 if ema8 > ema21 else 0,
+            1 if macd_line > sig_line else 0,
+            1 if stoch_k > stoch_d else 0,
+            1 if vol_ratio >= 0.8 else 0,
+            1 if adx_val > 25 else 0,
+            1 if rsi_val > 50 else 0,
+            1 if delta_bull else 0,
+        ])
+        conf_s = sum([
+            1 if is_dn else 0,
+            1 if ema8 < ema21 else 0,
+            1 if macd_line < sig_line else 0,
+            1 if stoch_k < stoch_d else 0,
+            1 if vol_ratio >= 0.8 else 0,
+            1 if adx_val > 25 else 0,
+            1 if rsi_val < 50 else 0,
+            1 if delta_bear else 0,
+        ])
+        vol_ok = vol_ratio >= 0.8
+        l_perf = is_up and long_pct >= dyn_thresh and conf_l >= 5 and vol_ok and rsi_val > 50 and delta_bull
+        s_perf = is_dn and short_pct >= dyn_thresh and conf_s >= 5 and vol_ok and rsi_val < 50 and delta_bear
+        nc_bias = "HAUSSE" if long_pct > short_pct else ("BAISSE" if short_pct > long_pct else "NEUTRE")
+        nc_res = {"longPct": long_pct, "shortPct": short_pct, "bias": nc_bias, "strongSetup": bool(l_perf or s_perf)}
+
+    # 2. Breakout Probability (Expo)
+    if n < 3:
+        bo_res = {"upPct": 50.0, "dnPct": 50.0, "bias": "NEUTRE", "winRate": None}
+    else:
+        g_tot = r_tot = ghh = gll = rhh = rll = 0
+        a1 = b1 = a2 = b2 = 0.0
+        wins = losses = 0
+        last_green = False
+        for i in range(1, n):
+            green = closes[i - 1] > opens[i - 1]
+            red = closes[i - 1] < opens[i - 1]
+            last_green = green
+            if green:
+                g_tot += 1
+            if red:
+                r_tot += 1
+            hh = highs[i] >= highs[i - 1]
+            ll = lows[i] <= lows[i - 1]
+            if green and hh and g_tot > 0:
+                ghh += 1
+                a1 = round((ghh / g_tot) * 100.0, 2)
+            if green and ll and g_tot > 0:
+                gll += 1
+                b1 = round((gll / g_tot) * 100.0, 2)
+            if red and hh and r_tot > 0:
+                rhh += 1
+                a2 = round((rhh / r_tot) * 100.0, 2)
+            if red and ll and r_tot > 0:
+                rll += 1
+                b2 = round((rll / r_tot) * 100.0, 2)
+            if green:
+                v = highs[i - 1] if max(a1, b1) == a1 else lows[i - 1]
+            else:
+                v = highs[i - 1] if max(a2, b2) == a2 else lows[i - 1]
+            if v == highs[i - 1]:
+                if highs[i] >= v:
+                    wins += 1
+                else:
+                    losses += 1
+            else:
+                if lows[i] <= v:
+                    wins += 1
+                else:
+                    losses += 1
+        has_g = g_tot > 0
+        has_r = r_tot > 0
+        raw_up = ((ghh / g_tot) * 100.0 if has_g else 50.0) if last_green else (((rhh / r_tot) * 100.0 if has_r else ((ghh / g_tot) * 100.0 if has_g else 50.0)))
+        raw_dn = ((gll / g_tot) * 100.0 if has_g else 50.0) if last_green else (((rll / r_tot) * 100.0 if has_r else ((gll / g_tot) * 100.0 if has_g else 50.0)))
+        up_pct = round(raw_up, 1)
+        dn_pct = round(raw_dn, 1)
+        bo_bias = "HAUSSE" if up_pct > dn_pct else ("BAISSE" if dn_pct > up_pct else "NEUTRE")
+        tot_tr = wins + losses
+        wr = round((wins / tot_tr) * 100.0, 1) if tot_tr > 0 else None
+        bo_res = {"upPct": up_pct, "dnPct": dn_pct, "bias": bo_bias, "winRate": wr}
+
+    # 3. Levels Strength Index [BigBeluga]
+    if n < 2:
+        ls_res = {"bullPct": 50, "bearPct": 50, "bias": "NEUTRE"}
+    else:
+        prev_end = n - 2
+        prev_start = max(0, prev_end - 19)
+        prev_upper = max(highs[prev_start:prev_end + 1])
+        cur_end = n - 1
+        cur_start = max(0, cur_end - 19)
+        lower_band_ls = min(lows[cur_start:cur_end + 1])
+        upper_band_ls = max(highs[cur_start:cur_end + 1])
+        step_ls = (upper_band_ls - lower_band_ls) / 10.0
+        src_now = closes[cur_end]
+        src_prev = closes[prev_end]
+        strength = 0
+        for i in range(11):
+            lvl = lower_band_ls + step_ls * i
+            if src_now > lvl and src_prev <= prev_upper:
+                strength += 1
+            if src_now < lvl and src_prev >= prev_upper:
+                strength -= 1
+        clamped = max(0, min(10, strength))
+        bull_pct = clamped * 10
+        bear_pct = 100 - bull_pct
+        ls_bias = "HAUSSE" if clamped > 5 else ("BAISSE" if clamped < 5 else "NEUTRE")
+        ls_res = {"bullPct": bull_pct, "bearPct": bear_pct, "bias": ls_bias}
+
+    return {"nextCandle": nc_res, "breakout": bo_res, "levelsStrength": ls_res}
+
+
 def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
     cfg = ZONES[tf]
     if tf == "30s":
@@ -241,7 +655,7 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
             "10m": mt5.TIMEFRAME_M10,
             "15m": mt5.TIMEFRAME_M15,
         }
-        df = fetch_mt5_rates(symbol, tf_map[tf], 140)
+        df = fetch_mt5_rates(symbol, tf_map[tf], 300)
 
     htf_bar = fetch_pivot_htf_candle(symbol, cfg["pivot_htf"])
     if df is None or len(df) < 35 or htf_bar is None:
@@ -351,7 +765,7 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
     pivot_p = (htf_bar["high"] + htf_bar["low"] + htf_bar["close"]) / 3.0
     v_pivot = 1 if c_now > pivot_p else (-1 if c_now < pivot_p else 0)
 
-    digits = 3 if symbol == "USDJPYm" else 5
+    digits = get_digits(symbol)
     zone_tfs = "30s" if tf == "30s" else ("1m, 3m" if tf in ("1m", "3m") else tf)
     zone_label = f"Zone {cfg['zone']} ({zone_tfs})"
 
@@ -447,6 +861,7 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
         "buy_count": buy_count,
         "sell_count": sell_count,
         "neutral_count": neutral_count,
+        "atr_value": atr_val,
         "atr_ratio": atr_ratio,
         "vol_ratio": vol_ratio,
         "price": c_now,
@@ -454,6 +869,7 @@ def analyze_pair_timeframe(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
         "pivot_htf": cfg["pivot_htf"],
         "indicators": indicators,
         "price_series": price_series,
+        "pine_forecast": compute_pine_forecast(df),
     }
 
 
@@ -493,7 +909,7 @@ def compute_support_resistance(
 ) -> Optional[Dict[str, Any]]:
     if current_price <= 0:
         return None
-    pip = 0.01 if symbol == "USDJPYm" else 0.0001
+    pip = get_pip_size(symbol)
     candidates: List[Dict[str, Any]] = []
     candidates.extend(collect_swing_candidates(df_1m, "1m", 80))
     candidates.extend(collect_swing_candidates(df_5m, "5m", 60))
@@ -619,9 +1035,11 @@ def render_dashboard_html(
     updated_at: str,
     sr_by_pair: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
     spread_by_pair: Optional[Dict[str, Optional[float]]] = None,
+    active_pairs: Optional[List[str]] = None,
 ) -> str:
+    pairs_to_render = list(active_pairs) if active_pairs else list(ACTIVE_PAIRS)
     payload: Dict[str, List[Dict[str, Any]]] = {}
-    for pair in PAIRS:
+    for pair in pairs_to_render:
         rows = []
         for tf in TIMEFRAMES:
             cfg = ZONES[tf]
@@ -639,12 +1057,14 @@ def render_dashboard_html(
                     "buy_count": 0,
                     "sell_count": 0,
                     "neutral_count": 0,
+                    "atr_value": 0.0,
                     "atr_ratio": 1.0,
                     "vol_ratio": 1.0,
                     "price": None,
                     "zone_label": default_zone_label,
                     "pivot_htf": cfg["pivot_htf"],
                     "indicators": [],
+                    "pine_forecast": None,
                 })
             else:
                 rows.append({
@@ -657,17 +1077,19 @@ def render_dashboard_html(
                     "buy_count": row["buy_count"],
                     "sell_count": row["sell_count"],
                     "neutral_count": row.get("neutral_count", max(0, 8 - row["buy_count"] - row["sell_count"])),
+                    "atr_value": row.get("atr_value", 0.0),
                     "atr_ratio": row.get("atr_ratio", 1.0),
                     "vol_ratio": row.get("vol_ratio", 1.0),
                     "price": row.get("price"),
                     "zone_label": row.get("zone_label", default_zone_label),
                     "pivot_htf": row.get("pivot_htf", cfg["pivot_htf"]),
                     "indicators": row.get("indicators", []),
+                    "pine_forecast": row.get("pine_forecast"),
                 })
         payload[pair] = rows
 
     price_payload: Dict[str, List[Dict[str, Any]]] = {}
-    for pair in PAIRS:
+    for pair in pairs_to_render:
         row_30s = results.get(pair, {}).get("30s")
         if mt5_ok and row_30s and isinstance(row_30s.get("price_series"), list):
             price_payload[pair] = row_30s["price_series"]
@@ -676,7 +1098,7 @@ def render_dashboard_html(
 
     sr_payload: Dict[str, Optional[Dict[str, Any]]] = {}
     spread_payload: Dict[str, Optional[float]] = {}
-    for pair in PAIRS:
+    for pair in pairs_to_render:
         sr_payload[pair] = (sr_by_pair or {}).get(pair) if mt5_ok else None
         raw_sp = (spread_by_pair or {}).get(pair) if mt5_ok else None
         spread_payload[pair] = round(float(raw_sp), 1) if raw_sp is not None else None
@@ -686,6 +1108,8 @@ def render_dashboard_html(
     sr_json = json.dumps(sr_payload, ensure_ascii=False)
     spread_json = json.dumps(spread_payload, ensure_ascii=False)
     updated_json = json.dumps(updated_at, ensure_ascii=False)
+    pairs_json = json.dumps(pairs_to_render, ensure_ascii=False)
+    suggested_json = json.dumps(SUGGESTED_PAIRS, ensure_ascii=False)
 
     return f"""<!DOCTYPE html>
 <html lang="fr">
@@ -719,9 +1143,17 @@ def render_dashboard_html(
       margin: 0 auto;
       padding: 16px 20px;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
-      gap: 24px;
+      gap: 16px;
+    }}
+    .header-brand {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 10px;
+      min-width: 0;
     }}
     .header-title {{
       font-size: 24px;
@@ -730,6 +1162,24 @@ def render_dashboard_html(
       color: #ffffff;
       white-space: nowrap;
       flex-shrink: 0;
+    }}
+    .header-winrate {{
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }}
+    .header-winrate-label {{
+      font-size: 13px;
+      font-weight: 500;
+      color: #94a3b8;
+    }}
+    .header-winrate-val {{
+      font-family: var(--font-mono);
+      font-size: 13px;
+      color: #94a3b8;
+      font-variant-numeric: tabular-nums;
     }}
     .header-actions {{
       display: flex;
@@ -799,6 +1249,19 @@ def render_dashboard_html(
       align-items: center;
       gap: 10px;
     }}
+    .pairs-right {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }}
+    .usd-strength {{
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }}
     .live-clock {{
       font-family: var(--font-mono);
       font-size: 20px;
@@ -807,35 +1270,40 @@ def render_dashboard_html(
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }}
+    .pair-item {{
+      display: inline-flex;
+      align-items: center;
+      border-radius: 12px;
+      border: 1px solid #1e2633;
+      background-color: #0f131a;
+      transition: background-color 0.15s ease, border-color 0.15s ease;
+    }}
+    .pair-item:hover {{
+      border-color: #475569;
+    }}
+    .pair-item.active {{
+      border-color: #cbd5e1;
+      background-color: #141b26;
+    }}
     .pair-label {{
       display: inline-flex;
       align-items: center;
       gap: 10px;
-      padding: 12px 20px;
-      border-radius: 12px;
-      border: 1px solid #1e2633;
-      background-color: #0f131a;
+      padding: 12px 14px 12px 16px;
       color: #cbd5e1;
       font-family: var(--font-mono);
       font-weight: 700;
       font-size: 15px;
       cursor: pointer;
       user-select: none;
-      transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
     }}
-    .pair-label:hover {{
-      border-color: #475569;
-      color: #ffffff;
-    }}
-    .pair-label.active {{
-      border-color: #10b981;
-      background-color: #052e1f50;
-      color: #6ee7b7;
-    }}
+    .pair-name-buy {{ color: #34d399; }}
+    .pair-name-sell {{ color: #f87171; }}
+    .pair-name-neutral {{ color: #ffffff; }}
     .pair-label input {{
       width: 16px;
       height: 16px;
-      accent-color: #10b981;
+      accent-color: #e2e8f0;
       cursor: pointer;
     }}
     .pair-setup-buy {{
@@ -851,6 +1319,141 @@ def render_dashboard_html(
       font-weight: 600;
       color: #f87171;
       white-space: nowrap;
+    }}
+    .pair-remove-btn {{
+      margin-right: 8px;
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      border: none;
+      background: transparent;
+      color: #94a3b8;
+      font-size: 16px;
+      line-height: 1;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: background-color 0.15s ease, color 0.15s ease;
+    }}
+    .pair-remove-btn:hover {{
+      background-color: #1e2633;
+      color: #f87171;
+    }}
+    .pair-add-btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 12px 16px;
+      border-radius: 12px;
+      border: 1px dashed #2b3648;
+      background-color: #0f131a;
+      color: #cbd5e1;
+      font-family: var(--font-sans);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
+      transition: border-color 0.15s ease, color 0.15s ease;
+    }}
+    .pair-add-btn:hover {{
+      border-color: #94a3b8;
+      color: #ffffff;
+    }}
+    .pair-add-panel {{
+      margin-bottom: 20px;
+      border-radius: 12px;
+      border: 1px solid #1e2633;
+      background-color: #0f131a;
+      padding: 14px 16px;
+    }}
+    .pair-add-row {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }}
+    .pair-suggest-group {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }}
+    .pair-suggest-title {{
+      font-size: 12px;
+      font-weight: 500;
+      color: #94a3b8;
+      margin-right: 4px;
+    }}
+    .pair-suggest-btn {{
+      border-radius: 8px;
+      border: 1px solid #1e2633;
+      background-color: #090c11;
+      color: #e2e8f0;
+      padding: 6px 10px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: border-color 0.15s ease, color 0.15s ease;
+    }}
+    .pair-suggest-btn:hover {{
+      border-color: #10b981;
+      color: #6ee7b7;
+    }}
+    .pair-form {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .pair-input {{
+      width: 185px;
+      border-radius: 8px;
+      border: 1px solid #1e2633;
+      background-color: #07090d;
+      padding: 6px 10px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #f1f5f9;
+      outline: none;
+    }}
+    .pair-input:focus {{
+      border-color: #10b981;
+    }}
+    .pair-submit-btn {{
+      border-radius: 8px;
+      border: none;
+      background-color: #059669;
+      color: #ffffff;
+      padding: 6px 12px;
+      font-family: var(--font-sans);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+    .pair-submit-btn:hover {{ background-color: #10b981; }}
+    .pair-close-btn {{
+      border-radius: 8px;
+      border: 1px solid #1e2633;
+      background-color: #090c11;
+      color: #cbd5e1;
+      padding: 6px 10px;
+      font-family: var(--font-sans);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+    .pair-error-msg {{
+      margin-top: 8px;
+      font-size: 12px;
+      font-weight: 500;
+      color: #fcd34d;
     }}
 
     /* Bandeau compact Setup 1m/3m, État du marché & Support/Résistance */
@@ -1240,7 +1843,14 @@ def render_dashboard_html(
 <body>
   <header class="header">
     <div class="header-inner">
-      <h1 class="header-title">Forex Agent Dashboard</h1>
+      <div class="header-brand">
+        <h1 class="header-title">Forex Agent Dashboard</h1>
+        <span class="banner-sep" aria-hidden="true">·</span>
+        <div class="header-winrate" title="Pourcentage de succès des 10 derniers setups résolus (après 3 bougies)">
+          <span class="header-winrate-label">Winrate Session</span>
+          <span class="header-winrate-val" id="headerWinrateVal">—</span>
+        </div>
+      </div>
       <div class="header-actions">
         <button type="button" class="sound-btn" id="soundBtn" aria-pressed="true"></button>
         <button type="button" class="refresh-btn" id="refreshBtn">
@@ -1259,8 +1869,14 @@ def render_dashboard_html(
   <main class="main">
     <div class="pairs-row">
       <div class="pairs-bar" id="pairSelector" role="radiogroup" aria-label="Sélection de la paire Forex"></div>
-      <div class="live-clock" id="liveClock" aria-label="Heure actuelle"></div>
+      <div class="pairs-right">
+        <span class="usd-strength" id="usdStrength"></span>
+        <span class="banner-sep" id="usdStrengthSep" style="display:none">·</span>
+        <div class="live-clock" id="liveClock" aria-label="Heure actuelle"></div>
+      </div>
     </div>
+
+    <div class="pair-add-panel" id="pairAddPanel" style="display:none"></div>
 
     <div class="status-banner" id="statusBanner"></div>
 
@@ -1298,7 +1914,9 @@ def render_dashboard_html(
     const SR_DATA = {sr_json};
     const SPREAD_DATA = {spread_json};
     const UPDATED_AT = {updated_json};
-    const PAIRS = ["EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm"];
+    const PAIRS = {pairs_json};
+    const SUGGESTED_PAIRS = {suggested_json};
+    const MAX_ACTIVE_PAIRS = {MAX_ACTIVE_PAIRS};
     const TIMEFRAMES = ["30s", "1m", "3m", "5m", "10m", "15m"];
     const STORAGE_PAIR = "forex_agent_selected_pair";
     const STORAGE_TF = "forex_agent_selected_tf";
@@ -1308,10 +1926,35 @@ def render_dashboard_html(
     const STORAGE_SCROLL_Y = "forex_agent_scroll_y";
 
     let selectedPair = localStorage.getItem(STORAGE_PAIR);
-    if (!PAIRS.includes(selectedPair)) selectedPair = "EURUSDm";
+    if (!PAIRS.includes(selectedPair)) selectedPair = PAIRS[0] || "EURUSDm";
     let selectedTfDetail = localStorage.getItem(STORAGE_TF);
     if (!TIMEFRAMES.includes(selectedTfDetail)) selectedTfDetail = "1m";
     let soundEnabled = localStorage.getItem(STORAGE_SOUND) !== "0";
+    let isAddPanelOpen = false;
+    let pairActionError = "";
+    let pairActionBusy = false;
+
+    function getPipSize(pair) {{
+      const u = String(pair || "").toUpperCase();
+      if (u.indexOf("XAU") !== -1 || u.indexOf("GOLD") !== -1) return 0.1;
+      if (u.indexOf("JPY") !== -1) return 0.01;
+      return 0.0001;
+    }}
+
+    function getPairDigits(pair) {{
+      const u = String(pair || "").toUpperCase();
+      if (u.indexOf("XAU") !== -1 || u.indexOf("GOLD") !== -1) return 2;
+      if (u.indexOf("JPY") !== -1) return 3;
+      return 5;
+    }}
+
+    function normalizeSymbolInput(raw) {{
+      const cleaned = String(raw || "").trim().replace(/\\s+/g, "");
+      if (!cleaned) return "";
+      if (/^[A-Za-z]{{6}}$/.test(cleaned)) return cleaned.toUpperCase() + "m";
+      if (/^[A-Za-z]{{6}}[mM]$/.test(cleaned)) return cleaned.slice(0, 6).toUpperCase() + "m";
+      return cleaned.slice(0, 16);
+    }}
 
     let audioCtx = null;
     function getAudioCtx() {{
@@ -1425,8 +2068,115 @@ def render_dashboard_html(
       try {{
         localStorage.setItem(STORAGE_TF, tf);
       }} catch (_e) {{}}
+      renderBanner();
       renderTable();
       renderDetails();
+    }}
+
+    function getForexSessionInfo(dateObj) {{
+      const d = dateObj || new Date();
+      const day = d.getUTCDay();
+      const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+      if (day === 6 || (day === 5 && mins >= 22 * 60) || (day === 0 && mins < 22 * 60)) {{
+        return {{ label: "Marché fermé · Week-end", tone: "WARN" }};
+      }}
+      if (mins >= 21 * 60 + 55 && mins <= 23 * 60 + 5) {{
+        return {{ label: "Rollover · Spread élevé", tone: "WARN" }};
+      }}
+      if (mins >= 12 * 60 && mins < 16 * 60) {{
+        return {{ label: "Londres + New York · Liquidité optimale", tone: "GOOD" }};
+      }}
+      if (mins >= 7 * 60 && mins < 12 * 60) {{
+        return {{ label: "Londres", tone: "NORMAL" }};
+      }}
+      if (mins >= 16 * 60 && mins < 21 * 60 + 55) {{
+        return {{ label: "New York", tone: "NORMAL" }};
+      }}
+      return {{ label: "Asie", tone: "NORMAL" }};
+    }}
+
+    function getPineConsensus(pf) {{
+      if (!pf || !pf.nextCandle || !pf.breakout || !pf.levelsStrength) {{
+        return {{ label: "—", bias: "NEUTRE", bullCount: 0, bearCount: 0 }};
+      }}
+      const biases = [pf.nextCandle.bias, pf.breakout.bias, pf.levelsStrength.bias];
+      const bullCount = biases.filter(b => b === "HAUSSE").length;
+      const bearCount = biases.filter(b => b === "BAISSE").length;
+      if (bullCount === 3) return {{ label: "3/3 Hausse", bias: "HAUSSE", bullCount, bearCount }};
+      if (bearCount === 3) return {{ label: "3/3 Baisse", bias: "BAISSE", bullCount, bearCount }};
+      if (bullCount === 2 && bearCount <= 1) return {{ label: "2/3 Hausse", bias: "HAUSSE", bullCount, bearCount }};
+      if (bearCount === 2 && bullCount <= 1) return {{ label: "2/3 Baisse", bias: "BAISSE", bullCount, bearCount }};
+      return {{ label: "Partagé", bias: "NEUTRE", bullCount, bearCount }};
+    }}
+
+    function computeUsdStrength(dataMap) {{
+      if (!dataMap) return null;
+      let score = 0;
+      let validPairs = 0;
+      PAIRS.forEach(p => {{
+        const upper = String(p || "").toUpperCase();
+        if (upper.indexOf("XAU") !== -1 || upper.indexOf("GOLD") !== -1) return;
+        const usdAtStart = upper.indexOf("USD") === 0;
+        const usdAsQuote = upper.slice(3, 6) === "USD";
+        if (!usdAtStart && !usdAsQuote) return;
+
+        const rows = (dataMap[p] || []).filter(r => r && r.direction !== "WAIT");
+        if (rows.length === 0) return;
+        const r1m = rows.find(r => r.timeframe === "1m");
+        const r5m = rows.find(r => r.timeframe === "5m");
+        const sample = [r1m, r5m].filter(Boolean);
+        const refs = sample.length > 0 ? sample : [rows[0]];
+        const avgNet = refs.reduce((acc, r) => acc + ((r.buy_count || 0) - (r.sell_count || 0)), 0) / refs.length;
+        const pairBias = avgNet >= 1.5 ? 1 : (avgNet <= -1.5 ? -1 : 0);
+        const usdDelta = usdAtStart ? pairBias : -pairBias;
+        score += usdDelta;
+        validPairs += 1;
+      }});
+      if (validPairs === 0) return null;
+      const threshold = validPairs >= 4 ? 2 : 1;
+      if (score >= threshold) return {{ score, maxScore: validPairs, label: "USD Fort", bias: "HAUSSE" }};
+      if (score <= -threshold) return {{ score, maxScore: validPairs, label: "USD Faible", bias: "BAISSE" }};
+      return {{ score, maxScore: validPairs, label: "USD Neutre", bias: "NEUTRE" }};
+    }}
+
+    function computeRiskEstimate(pair, atrVal, sr, dirHint) {{
+      if (typeof atrVal !== "number" || !Number.isFinite(atrVal) || atrVal <= 0) return null;
+      const pip = getPipSize(pair);
+      const slPips = Number(((1.5 * atrVal) / pip).toFixed(1));
+      if (slPips <= 0) return null;
+      let obstaclePips = null;
+      if (dirHint === "ACHAT" && sr && sr.resistance) {{
+        obstaclePips = sr.resistance.distancePips;
+      }} else if (dirHint === "VENTE" && sr && sr.support) {{
+        obstaclePips = sr.support.distancePips;
+      }} else if (sr && sr.support && sr.resistance) {{
+        obstaclePips = Math.min(sr.support.distancePips, sr.resistance.distancePips);
+      }} else if (sr && sr.resistance) {{
+        obstaclePips = sr.resistance.distancePips;
+      }} else if (sr && sr.support) {{
+        obstaclePips = sr.support.distancePips;
+      }}
+      const rrRatio = (obstaclePips !== null && Number.isFinite(obstaclePips) && obstaclePips > 0)
+        ? Number((obstaclePips / slPips).toFixed(1))
+        : null;
+      return {{ slPips, rrRatio }};
+    }}
+
+    function renderUsdStrength() {{
+      const el = document.getElementById("usdStrength");
+      const sep = document.getElementById("usdStrengthSep");
+      if (!el || !sep) return;
+      const usd = computeUsdStrength(DATA);
+      if (!usd) {{
+        el.textContent = "";
+        sep.style.display = "none";
+        return;
+      }}
+      const signed = usd.score > 0 ? "+" + usd.score : String(usd.score);
+      el.textContent = usd.label + " (" + signed + "/" + usd.maxScore + ")";
+      el.style.color = usd.bias === "HAUSSE" ? "#34d399" : (usd.bias === "BAISSE" ? "#f87171" : "#94a3b8");
+      el.title = "Force relative du Dollar US calculée sur les paires USD actives (1m/5m)";
+      sep.style.display = "inline";
     }}
 
     function evaluatePairSetup(rows) {{
@@ -1538,21 +2288,144 @@ def render_dashboard_html(
       renderChart();
     }}
 
+    function renderAddPairPanel() {{
+      const panel = document.getElementById("pairAddPanel");
+      if (!panel) return;
+      if (!isAddPanelOpen) {{
+        panel.style.display = "none";
+        panel.innerHTML = "";
+        return;
+      }}
+      panel.style.display = "block";
+      panel.innerHTML = "";
+
+      const row = document.createElement("div");
+      row.className = "pair-add-row";
+
+      const suggestGroup = document.createElement("div");
+      suggestGroup.className = "pair-suggest-group";
+      const title = document.createElement("span");
+      title.className = "pair-suggest-title";
+      title.textContent = "Paires suggérées (" + PAIRS.length + "/" + MAX_ACTIVE_PAIRS + ") :";
+      suggestGroup.appendChild(title);
+
+      SUGGESTED_PAIRS.filter(s => !PAIRS.includes(s)).forEach(sym => {{
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "pair-suggest-btn";
+        btn.textContent = "+ " + sym;
+        btn.disabled = pairActionBusy;
+        btn.addEventListener("click", () => managePair("add", sym));
+        suggestGroup.appendChild(btn);
+      }});
+
+      const form = document.createElement("form");
+      form.className = "pair-form";
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.className = "pair-input";
+      inp.placeholder = "Ex: EURJPYm ou XAUUSDm";
+      inp.setAttribute("aria-label", "Nom du symbole personnalisé");
+      const subBtn = document.createElement("button");
+      subBtn.type = "submit";
+      subBtn.className = "pair-submit-btn";
+      subBtn.disabled = pairActionBusy;
+      subBtn.textContent = pairActionBusy ? "..." : "Valider";
+      const clsBtn = document.createElement("button");
+      clsBtn.type = "button";
+      clsBtn.className = "pair-close-btn";
+      clsBtn.textContent = "Fermer";
+      clsBtn.addEventListener("click", () => {{
+        isAddPanelOpen = false;
+        pairActionError = "";
+        renderAddPairPanel();
+      }});
+      form.addEventListener("submit", (e) => {{
+        e.preventDefault();
+        managePair("add", inp.value);
+      }});
+      form.append(inp, subBtn, clsBtn);
+      row.append(suggestGroup, form);
+      panel.appendChild(row);
+
+      if (pairActionError) {{
+        const errEl = document.createElement("p");
+        errEl.className = "pair-error-msg";
+        errEl.textContent = pairActionError;
+        panel.appendChild(errEl);
+      }}
+    }}
+
+    async function managePair(action, rawSymbol) {{
+      if (pairActionBusy) return;
+      const symbol = normalizeSymbolInput(rawSymbol);
+      if (action === "add" && !symbol) {{
+        pairActionError = "Veuillez saisir un symbole valide (ex: EURJPYm ou XAUUSDm).";
+        renderAddPairPanel();
+        return;
+      }}
+      if (window.location.protocol === "file:") {{
+        pairActionError = "Lancez lancer_forex_agent.bat pour ajouter/supprimer des paires depuis le navigateur.";
+        isAddPanelOpen = true;
+        renderAddPairPanel();
+        return;
+      }}
+      pairActionBusy = true;
+      pairActionError = "";
+      renderAddPairPanel();
+      try {{
+        const res = await fetch("/api/pairs", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ action, symbol }}),
+        }});
+        const data = await res.json();
+        if (!res.ok || !data.ok) {{
+          pairActionError = data.error || "Impossible de modifier la liste des paires.";
+          isAddPanelOpen = true;
+          pairActionBusy = false;
+          renderAddPairPanel();
+          return;
+        }}
+        if (action === "add") {{
+          localStorage.setItem(STORAGE_PAIR, data.symbol || symbol);
+        }} else if (action === "remove" && selectedPair === symbol && Array.isArray(data.pairs) && data.pairs.length > 0) {{
+          localStorage.setItem(STORAGE_PAIR, data.pairs[0]);
+        }}
+        reloadPreservingScroll();
+      }} catch (_err) {{
+        pairActionError = "Serveur local python injoignable. Relancez lancer_forex_agent.bat.";
+        isAddPanelOpen = true;
+        pairActionBusy = false;
+        renderAddPairPanel();
+      }}
+    }}
+
     function renderPairs() {{
       const wrap = document.getElementById("pairSelector");
       wrap.innerHTML = "";
+      const usd = computeUsdStrength(DATA);
+      const nameCls = usd && usd.bias === "HAUSSE"
+        ? "pair-name-buy"
+        : (usd && usd.bias === "BAISSE" ? "pair-name-sell" : "pair-name-neutral");
       PAIRS.forEach(p => {{
         const setup = evaluatePairSetup(DATA[p] || []);
+        const item = document.createElement("div");
+        item.className = "pair-item" + (p === selectedPair ? " active" : "");
+
         const lbl = document.createElement("label");
-        lbl.className = "pair-label" + (p === selectedPair ? " active" : "");
+        lbl.className = "pair-label";
         const inp = document.createElement("input");
         inp.type = "radio";
         inp.name = "pair";
         inp.value = p;
         inp.checked = (p === selectedPair);
         inp.addEventListener("change", () => selectPairAndRender(p));
+        const nameEl = document.createElement("span");
+        nameEl.className = nameCls;
+        nameEl.textContent = p;
         lbl.appendChild(inp);
-        lbl.appendChild(document.createTextNode(p));
+        lbl.appendChild(nameEl);
         if (setup.status === "READY_BUY" || setup.status === "READY_SELL") {{
           const sep = document.createElement("span");
           sep.className = "banner-sep";
@@ -1563,8 +2436,37 @@ def render_dashboard_html(
           lbl.appendChild(sep);
           lbl.appendChild(st);
         }}
-        wrap.appendChild(lbl);
+        item.appendChild(lbl);
+
+        if (PAIRS.length > 1) {{
+          const remBtn = document.createElement("button");
+          remBtn.type = "button";
+          remBtn.className = "pair-remove-btn";
+          remBtn.title = "Supprimer " + p;
+          remBtn.setAttribute("aria-label", "Supprimer " + p);
+          remBtn.textContent = "×";
+          remBtn.addEventListener("click", () => managePair("remove", p));
+          item.appendChild(remBtn);
+        }}
+
+        wrap.appendChild(item);
       }});
+
+      if (PAIRS.length < MAX_ACTIVE_PAIRS) {{
+        const addBtn = document.createElement("button");
+        addBtn.type = "button";
+        addBtn.className = "pair-add-btn";
+        addBtn.textContent = "+ Ajouter";
+        addBtn.setAttribute("aria-expanded", isAddPanelOpen ? "true" : "false");
+        addBtn.addEventListener("click", () => {{
+          isAddPanelOpen = !isAddPanelOpen;
+          pairActionError = "";
+          renderPairs();
+          renderAddPairPanel();
+        }});
+        wrap.appendChild(addBtn);
+      }}
+      renderAddPairPanel();
     }}
 
     function renderBanner() {{
@@ -1572,7 +2474,7 @@ def render_dashboard_html(
       const rows = DATA[selectedPair] || [];
       const sr = SR_DATA[selectedPair] || null;
       const spreadVal = typeof SPREAD_DATA[selectedPair] === "number" ? SPREAD_DATA[selectedPair] : null;
-      const digits = selectedPair === "USDJPYm" ? 3 : 5;
+      const digits = getPairDigits(selectedPair);
       banner.innerHTML = "";
 
       const isWait = rows.length === 0 || rows.every(r => r.direction === "WAIT");
@@ -1599,13 +2501,22 @@ def render_dashboard_html(
       sep2.textContent = "·";
       const marketVal = document.createElement("span");
 
+      const sessionInfo = getForexSessionInfo(new Date());
+      const sessionSep = document.createElement("span");
+      sessionSep.className = "banner-sep";
+      sessionSep.textContent = "·";
+      const sessionEl = document.createElement("span");
+      sessionEl.className = sessionInfo.tone === "WARN" ? "tone-warn" : (sessionInfo.tone === "GOOD" ? "tone-buy" : "banner-ratios");
+      sessionEl.style.fontSize = "12px";
+      sessionEl.textContent = "Session : " + sessionInfo.label;
+
       if (isWait) {{
         setupVal.className = "tone-warn";
         setupVal.textContent = "En attente des données MT5";
         marketVal.className = "tone-warn";
         marketVal.textContent = "WAIT";
         leftGroup.append(setupLbl, sep1, setupVal);
-        rightGroup.append(marketLbl, sep2, marketVal);
+        rightGroup.append(marketLbl, sep2, marketVal, sessionSep, sessionEl);
         topRow.append(leftGroup, rightGroup);
         banner.appendChild(topRow);
         return;
@@ -1641,11 +2552,13 @@ def render_dashboard_html(
         spreadEl.textContent = "Spread " + spreadVal.toFixed(1) + " pips" + (isWide ? " · Spread large" : "");
         rightGroup.append(sep4, spreadEl);
       }}
+      rightGroup.append(sessionSep, sessionEl);
 
       topRow.append(leftGroup, rightGroup);
       banner.appendChild(topRow);
 
-      // Deuxième ligne : Support / Résistance & Alerte de prudence
+      // Deuxième ligne : Support / Résistance, Alerte de prudence & Référence risque (SL ATR + R:R)
+      const activeRow = rows.find(r => r.timeframe === selectedTfDetail) || rows[0];
       const srRow = document.createElement("div");
       srRow.className = "banner-row banner-sr-row";
       const srLeft = document.createElement("div");
@@ -1683,25 +2596,155 @@ def render_dashboard_html(
       srLeft.append(srLbl, srSep1, sEl, srSep2, rEl);
 
       const srRight = document.createElement("div");
+      srRight.className = "banner-group";
+      const srAlertSpan = document.createElement("span");
       if (!sr) {{
-        srRight.className = "tone-subtle";
-        srRight.textContent = "En attente des niveaux S/R";
+        srAlertSpan.className = "tone-subtle";
+        srAlertSpan.textContent = "En attente des niveaux S/R";
       }} else if (sr.proximityAlert === "NEAR_BOTH") {{
-        srRight.className = "tone-warn";
-        srRight.textContent = "Compression entre Support et Résistance · Prudence";
+        srAlertSpan.className = "tone-warn";
+        srAlertSpan.textContent = "Compression entre Support et Résistance · Prudence";
       }} else if (sr.proximityAlert === "NEAR_RESISTANCE" && sr.resistance) {{
-        srRight.className = "tone-warn";
-        srRight.textContent = "Prudence ACHAT · Proche Résistance (" + sr.resistance.distancePips.toFixed(1) + " pips)";
+        srAlertSpan.className = "tone-warn";
+        srAlertSpan.textContent = "Prudence ACHAT · Proche Résistance (" + sr.resistance.distancePips.toFixed(1) + " pips)";
       }} else if (sr.proximityAlert === "NEAR_SUPPORT" && sr.support) {{
-        srRight.className = "tone-warn";
-        srRight.textContent = "Prudence VENTE · Proche Support (" + sr.support.distancePips.toFixed(1) + " pips)";
+        srAlertSpan.className = "tone-warn";
+        srAlertSpan.textContent = "Prudence VENTE · Proche Support (" + sr.support.distancePips.toFixed(1) + " pips)";
       }} else {{
-        srRight.className = "tone-subtle";
-        srRight.textContent = "Zone libre entre Support et Résistance";
+        srAlertSpan.className = "tone-subtle";
+        srAlertSpan.textContent = "Zone libre entre Support et Résistance";
+      }}
+      srRight.appendChild(srAlertSpan);
+
+      const atrForRisk = activeRow && typeof activeRow.atr_value === "number" && activeRow.atr_value > 0
+        ? activeRow.atr_value
+        : (rows[0] ? rows[0].atr_value : 0);
+      const dirHint = setup.direction || (activeRow ? activeRow.direction : "NEUTRE");
+      const riskEst = computeRiskEstimate(selectedPair, atrForRisk, sr, dirHint);
+      if (riskEst) {{
+        const riskSep1 = document.createElement("span");
+        riskSep1.className = "banner-sep";
+        riskSep1.textContent = "·";
+        const slEl = document.createElement("span");
+        slEl.className = "banner-ratios";
+        slEl.style.color = "#cbd5e1";
+        slEl.textContent = "SL ~" + riskEst.slPips.toFixed(1) + " pips";
+        srRight.append(riskSep1, slEl);
+
+        if (riskEst.rrRatio !== null) {{
+          const riskSep2 = document.createElement("span");
+          riskSep2.className = "banner-sep";
+          riskSep2.textContent = "·";
+          const rrEl = document.createElement("span");
+          rrEl.className = "banner-ratios";
+          rrEl.style.fontWeight = "600";
+          rrEl.style.color = riskEst.rrRatio >= 1.5 ? "#34d399" : (riskEst.rrRatio < 1.0 ? "#fcd34d" : "#cbd5e1");
+          rrEl.textContent = "R:R ~" + riskEst.rrRatio.toFixed(1) + "x";
+          srRight.append(riskSep2, rrEl);
+        }}
       }}
 
       srRow.append(srLeft, srRight);
       banner.appendChild(srRow);
+
+      // Troisième ligne : 3 indicateurs Pine Script de prévision + Accord Pine (informatif)
+      const pf = activeRow && activeRow.pine_forecast ? activeRow.pine_forecast : null;
+      const pfRow = document.createElement("div");
+      pfRow.className = "banner-row banner-sr-row";
+      const pfLeft = document.createElement("div");
+      pfLeft.className = "banner-group";
+
+      const pfLbl = document.createElement("span");
+      pfLbl.className = "banner-label";
+      pfLbl.textContent = "Prévision Pine (" + (activeRow ? activeRow.timeframe : selectedTfDetail) + ")";
+      const pfSep0 = document.createElement("span");
+      pfSep0.className = "banner-sep";
+      pfSep0.textContent = "·";
+      pfLeft.append(pfLbl, pfSep0);
+
+      if (!pf) {{
+        const waitPf = document.createElement("span");
+        waitPf.className = "tone-subtle";
+        waitPf.textContent = "En attente des données MT5";
+        pfLeft.appendChild(waitPf);
+      }} else {{
+        const nc = pf.nextCandle;
+        const bo = pf.breakout;
+        const ls = pf.levelsStrength;
+
+        const ncLbl = document.createElement("span");
+        ncLbl.className = "tone-subtle";
+        ncLbl.textContent = "Next Candle :";
+        const ncVal = document.createElement("span");
+        ncVal.className = "sr-val " + (nc.bias === "HAUSSE" ? "tone-buy" : (nc.bias === "BAISSE" ? "tone-sell" : "tone-muted"));
+        const ncDomPct = nc.bias === "BAISSE" ? nc.shortPct : nc.longPct;
+        const ncDomWord = nc.bias === "HAUSSE" ? "Hausse" : (nc.bias === "BAISSE" ? "Baisse" : "Neutre");
+        ncVal.textContent = ncDomPct + "% " + ncDomWord;
+        const ncSub = document.createElement("span");
+        ncSub.className = "banner-ratios";
+        ncSub.textContent = "(" + (nc.bias === "BAISSE" ? nc.longPct + "% ▲" : nc.shortPct + "% ▼") + (nc.strongSetup ? " · Fort" : "") + ")";
+
+        const pfSep1 = document.createElement("span");
+        pfSep1.className = "banner-sep";
+        pfSep1.textContent = "·";
+
+        const boLbl = document.createElement("span");
+        boLbl.className = "tone-subtle";
+        boLbl.textContent = "Breakout :";
+        const boVal = document.createElement("span");
+        boVal.className = "sr-val " + (bo.bias === "HAUSSE" ? "tone-buy" : (bo.bias === "BAISSE" ? "tone-sell" : "tone-muted"));
+        boVal.textContent = bo.upPct.toFixed(1) + "% ▲ / " + bo.dnPct.toFixed(1) + "% ▼";
+
+        pfLeft.append(ncLbl, ncVal, ncSub, pfSep1, boLbl, boVal);
+        if (typeof bo.winRate === "number") {{
+          const boWr = document.createElement("span");
+          boWr.className = "banner-ratios";
+          boWr.textContent = "(WR " + bo.winRate.toFixed(0) + "%)";
+          pfLeft.appendChild(boWr);
+        }}
+
+        const pfSep2 = document.createElement("span");
+        pfSep2.className = "banner-sep";
+        pfSep2.textContent = "·";
+
+        const lsLbl = document.createElement("span");
+        lsLbl.className = "tone-subtle";
+        lsLbl.textContent = "Levels :";
+        const lsVal = document.createElement("span");
+        lsVal.className = "sr-val " + (ls.bias === "HAUSSE" ? "tone-buy" : (ls.bias === "BAISSE" ? "tone-sell" : "tone-muted"));
+        const lsDomPct = ls.bias === "BAISSE" ? ls.bearPct : ls.bullPct;
+        const lsDomWord = ls.bias === "HAUSSE" ? "Hausse" : (ls.bias === "BAISSE" ? "Baisse" : "Neutre");
+        lsVal.textContent = lsDomPct + "% " + lsDomWord;
+        const lsSub = document.createElement("span");
+        lsSub.className = "banner-ratios";
+        lsSub.textContent = "(" + (ls.bias === "BAISSE" ? ls.bullPct + "% ▲" : ls.bearPct + "% ▼") + ")";
+
+        pfLeft.append(pfSep2, lsLbl, lsVal, lsSub);
+      }}
+
+      const pfRight = document.createElement("div");
+      pfRight.className = "banner-group";
+      if (pf) {{
+        const cons = getPineConsensus(pf);
+        const cLbl = document.createElement("span");
+        cLbl.className = "banner-ratios";
+        cLbl.textContent = "Accord Pine :";
+        const cVal = document.createElement("span");
+        cVal.className = "banner-ratios";
+        cVal.style.fontWeight = "600";
+        cVal.style.color = cons.bias === "HAUSSE" ? "#34d399" : (cons.bias === "BAISSE" ? "#f87171" : "#cbd5e1");
+        cVal.textContent = cons.label;
+        const cSep = document.createElement("span");
+        cSep.className = "banner-sep";
+        cSep.textContent = "·";
+        pfRight.append(cLbl, cVal, cSep);
+      }}
+      const infoEl = document.createElement("span");
+      infoEl.className = "banner-ratios";
+      infoEl.textContent = "Informatif";
+      pfRight.appendChild(infoEl);
+      pfRow.append(pfLeft, pfRight);
+      banner.appendChild(pfRow);
     }}
 
     function renderTable() {{
@@ -1856,7 +2899,7 @@ def render_dashboard_html(
         return;
       }}
 
-      const digits = selectedPair === "USDJPYm" ? 3 : 5;
+      const digits = getPairDigits(selectedPair);
       const latest = series[series.length - 1].price;
       const first = series[0].price;
       const strokeColor = latest >= first ? "#10b981" : "#ef4444";
@@ -1913,7 +2956,7 @@ def render_dashboard_html(
 
       const W = 1000;
       const H = 224;
-      const padL = digits === 3 ? 64 : 74;
+      const padL = digits <= 3 ? 68 : 74;
       const padR = 14;
       const padT = 12;
       const padB = 26;
@@ -1926,7 +2969,7 @@ def render_dashboard_html(
         if (pt.price < minP) minP = pt.price;
         if (pt.price > maxP) maxP = pt.price;
       }});
-      const pip = selectedPair === "USDJPYm" ? 0.01 : 0.0001;
+      const pip = getPipSize(selectedPair);
       const span = maxP - minP || pip;
       const showSupport = support && support.price >= minP - span * 0.65 && support.price <= maxP + span * 0.65;
       const showResistance = resistance && resistance.price >= minP - span * 0.65 && resistance.price <= maxP + span * 0.65;
@@ -2142,6 +3185,21 @@ def render_dashboard_html(
       cnt.className = "details-zone font-mono tabular-nums";
       cnt.textContent = entries.length + " / 10";
       titleWrap.append(title, cnt);
+
+      const resolved = entries.filter(e => e.outcomeStatus === "WIN" || e.outcomeStatus === "LOSS");
+      if (resolved.length > 0) {{
+        const wins = resolved.filter(e => e.outcomeStatus === "WIN").length;
+        const winRatePct = Math.round((wins / resolved.length) * 100);
+        const sep = document.createElement("span");
+        sep.className = "banner-sep";
+        sep.textContent = "·";
+        const wr = document.createElement("span");
+        wr.className = "details-zone font-mono tabular-nums";
+        wr.style.fontWeight = "600";
+        wr.style.color = winRatePct >= 50 ? "#34d399" : "#fcd34d";
+        wr.textContent = "Taux : " + wins + "/" + resolved.length + " (" + winRatePct + "%)";
+        titleWrap.append(sep, wr);
+      }}
       header.appendChild(titleWrap);
 
       if (entries.length > 0) {{
@@ -2152,6 +3210,7 @@ def render_dashboard_html(
         clearBtn.addEventListener("click", () => {{
           localStorage.removeItem(STORAGE_HISTORY);
           renderHistory([]);
+          renderHeaderWinrate();
         }});
         header.appendChild(clearBtn);
       }}
@@ -2170,14 +3229,16 @@ def render_dashboard_html(
       const table = document.createElement("table");
       table.className = "history-table";
       const thead = document.createElement("thead");
-      thead.innerHTML = "<tr><th>Heure</th><th>Paire</th><th>TF</th><th>Sens</th><th>Prix</th><th>Spread</th><th>Contexte S/R</th></tr>";
+      thead.innerHTML = "<tr><th>Heure</th><th>Paire</th><th>TF</th><th>Sens</th><th>Prix</th><th>Spread</th><th>Accord Pine</th><th>Contexte S/R</th><th>Résultat (3 bougies)</th></tr>";
       table.appendChild(thead);
 
       const tbody = document.createElement("tbody");
       entries.forEach(item => {{
         const tr = document.createElement("tr");
-        tr.addEventListener("click", () => selectPairAndRender(item.pair));
-        const d = item.pair === "USDJPYm" ? 3 : 5;
+        tr.addEventListener("click", () => {{
+          if (PAIRS.includes(item.pair)) selectPairAndRender(item.pair);
+        }});
+        const d = getPairDigits(item.pair);
 
         const tdTime = document.createElement("td");
         tdTime.className = "font-mono tabular-nums";
@@ -2209,11 +3270,44 @@ def render_dashboard_html(
         tdSpread.style.color = "#cbd5e1";
         tdSpread.textContent = typeof item.spreadPips === "number" ? item.spreadPips.toFixed(1) + " pips" : "—";
 
+        const tdPine = document.createElement("td");
+        tdPine.className = "font-mono";
+        const pineTxt = item.pineNote || "—";
+        tdPine.textContent = pineTxt;
+        if (pineTxt.indexOf("Hausse") !== -1) {{
+          tdPine.style.color = "#34d399";
+          tdPine.style.fontWeight = "600";
+        }} else if (pineTxt.indexOf("Baisse") !== -1) {{
+          tdPine.style.color = "#f87171";
+          tdPine.style.fontWeight = "600";
+        }} else {{
+          tdPine.style.color = "#94a3b8";
+        }}
+
         const tdSr = document.createElement("td");
         tdSr.style.color = "#94a3b8";
         tdSr.textContent = item.srNote || "—";
 
-        tr.append(tdTime, tdPair, tdTf, tdDir, tdPrice, tdSpread, tdSr);
+        const tdOutcome = document.createElement("td");
+        tdOutcome.className = "font-mono tabular-nums";
+        if (item.outcomeStatus === "PENDING") {{
+          tdOutcome.style.color = "#94a3b8";
+          tdOutcome.textContent = "En cours";
+        }} else if (item.outcomeStatus === "WIN" && typeof item.outcomePips === "number") {{
+          tdOutcome.style.color = "#34d399";
+          tdOutcome.style.fontWeight = "600";
+          tdOutcome.textContent = "+" + Math.abs(item.outcomePips).toFixed(1) + " pips · Gagnant";
+        }} else if (item.outcomeStatus === "LOSS" && typeof item.outcomePips === "number") {{
+          tdOutcome.style.color = "#f87171";
+          tdOutcome.style.fontWeight = "600";
+          const formatted = item.outcomePips <= 0 ? item.outcomePips.toFixed(1) : "-" + item.outcomePips.toFixed(1);
+          tdOutcome.textContent = formatted + " pips · Perdant";
+        }} else {{
+          tdOutcome.style.color = "#64748b";
+          tdOutcome.textContent = "—";
+        }}
+
+        tr.append(tdTime, tdPair, tdTf, tdDir, tdPrice, tdSpread, tdPine, tdSr, tdOutcome);
         tbody.appendChild(tr);
       }});
       table.appendChild(tbody);
@@ -2230,7 +3324,9 @@ def render_dashboard_html(
       }}
       const newEntries = [];
       let changed = false;
-      const nowTime = fmtClockHHMMSS(new Date());
+      const nowDate = new Date();
+      const nowTime = fmtClockHHMMSS(nowDate);
+      const nowSec = Math.floor(nowDate.getTime() / 1000);
 
       PAIRS.forEach(p => {{
         const rows = DATA[p] || [];
@@ -2240,6 +3336,8 @@ def render_dashboard_html(
           ? setup.direction + ":" + setup.triggerTf
           : "NONE";
         if (sig !== "NONE" && prevSigs[p] !== sig && setup.triggerPrice !== null) {{
+          const triggerRow = rows.find(r => r.timeframe === setup.triggerTf);
+          const pineNote = getPineConsensus(triggerRow ? triggerRow.pine_forecast : null).label;
           newEntries.push({{
             id: String(Date.now()) + "-" + p,
             time: nowTime,
@@ -2249,6 +3347,10 @@ def render_dashboard_html(
             price: setup.triggerPrice,
             spreadPips: typeof SPREAD_DATA[p] === "number" ? SPREAD_DATA[p] : null,
             srNote: formatSrNote(SR_DATA[p] || null),
+            triggeredAtSec: nowSec,
+            pineNote,
+            outcomeStatus: "PENDING",
+            outcomePips: null,
           }});
         }}
         if (prevSigs[p] !== sig) {{
@@ -2262,23 +3364,72 @@ def render_dashboard_html(
       }}
 
       let history = loadHistory();
-      if (newEntries.length > 0) {{
+      let anyResolved = false;
+      history = history.map(item => {{
+        if ((item.outcomeStatus === "PENDING" || !item.outcomeStatus) && typeof item.triggeredAtSec === "number") {{
+          const horizonSec = item.timeframe === "1m" ? 180 : 540;
+          if (nowSec - item.triggeredAtSec >= horizonSec) {{
+            const pairRows = DATA[item.pair] || [];
+            const priceRow = pairRows.find(r => typeof r.price === "number" && r.price > 0);
+            if (priceRow) {{
+              const pip = getPipSize(item.pair);
+              const rawPips = item.direction === "ACHAT"
+                ? (priceRow.price - item.price) / pip
+                : (item.price - priceRow.price) / pip;
+              const roundedPips = Number(rawPips.toFixed(1));
+              anyResolved = true;
+              return Object.assign({{}}, item, {{
+                outcomeStatus: roundedPips > 0 ? "WIN" : "LOSS",
+                outcomePips: roundedPips,
+              }});
+            }}
+          }}
+        }}
+        return item;
+      }});
+
+      if (newEntries.length > 0 || anyResolved) {{
         history = newEntries.concat(history).slice(0, 10);
         localStorage.setItem(STORAGE_HISTORY, JSON.stringify(history));
-        if (soundEnabled) {{
+        if (newEntries.length > 0 && soundEnabled) {{
           playSetupChime(newEntries[0].direction);
         }}
       }}
       renderHistory(history);
     }}
 
+    function computeSessionWinrate() {{
+      const entries = loadHistory().slice(0, 10);
+      const resolved = entries.filter(e => e.outcomeStatus === "WIN" || e.outcomeStatus === "LOSS");
+      const wins = resolved.filter(e => e.outcomeStatus === "WIN").length;
+      const pct = resolved.length > 0 ? Math.round((wins / resolved.length) * 100) : null;
+      return {{ wins, total: resolved.length, pct }};
+    }}
+
+    function renderHeaderWinrate() {{
+      const el = document.getElementById("headerWinrateVal");
+      if (!el) return;
+      const wrInfo = computeSessionWinrate();
+      if (wrInfo.pct === null) {{
+        el.textContent = "—";
+        el.style.color = "#94a3b8";
+        el.style.fontWeight = "400";
+      }} else {{
+        el.textContent = wrInfo.pct + "% (" + wrInfo.wins + "/" + wrInfo.total + ")";
+        el.style.color = wrInfo.pct >= 50 ? "#34d399" : "#fcd34d";
+        el.style.fontWeight = "600";
+      }}
+    }}
+
     renderSoundButton();
     renderPairs();
+    renderUsdStrength();
+    processSetupsAndRenderHistory();
+    renderHeaderWinrate();
     renderBanner();
     renderTable();
     renderDetails();
     renderChart();
-    processSetupsAndRenderHistory();
     document.getElementById("liveClock").textContent = fmtClockHHMMSS(new Date());
 
     try {{
@@ -2315,9 +3466,10 @@ def write_dashboard_atomically(html_content: str) -> None:
     os.replace(tmp_path, DASHBOARD_HTML_PATH)
 
 
-def compute_sr_map() -> Dict[str, Optional[Dict[str, Any]]]:
-    sr_map: Dict[str, Optional[Dict[str, Any]]] = {p: None for p in PAIRS}
-    for pair in PAIRS:
+def compute_sr_map(pairs_list: Optional[List[str]] = None) -> Dict[str, Optional[Dict[str, Any]]]:
+    target_pairs = list(pairs_list) if pairs_list is not None else list(ACTIVE_PAIRS)
+    sr_map: Dict[str, Optional[Dict[str, Any]]] = {p: None for p in target_pairs}
+    for pair in target_pairs:
         try:
             df_1m = fetch_mt5_rates(pair, mt5.TIMEFRAME_M1, 120)
             df_5m = fetch_mt5_rates(pair, mt5.TIMEFRAME_M5, 80)
@@ -2336,15 +3488,16 @@ def compute_sr_map() -> Dict[str, Optional[Dict[str, Any]]]:
     return sr_map
 
 
-def compute_spread_map() -> Dict[str, Optional[float]]:
-    spread_map: Dict[str, Optional[float]] = {p: None for p in PAIRS}
+def compute_spread_map(pairs_list: Optional[List[str]] = None) -> Dict[str, Optional[float]]:
+    target_pairs = list(pairs_list) if pairs_list is not None else list(ACTIVE_PAIRS)
+    spread_map: Dict[str, Optional[float]] = {p: None for p in target_pairs}
     if mt5 is None:
         return spread_map
-    for pair in PAIRS:
+    for pair in target_pairs:
         try:
             tick = mt5.symbol_info_tick(pair)
             if tick is not None and getattr(tick, "ask", 0) > 0 and getattr(tick, "bid", 0) > 0:
-                pip = 0.01 if pair == "USDJPYm" else 0.0001
+                pip = get_pip_size(pair)
                 spread_map[pair] = round(max(0.0, (float(tick.ask) - float(tick.bid)) / pip), 1)
         except Exception as exc:
             print(f"[ERREUR] Spread {pair} : {exc}")
@@ -2352,67 +3505,271 @@ def compute_spread_map() -> Dict[str, Optional[float]]:
     return spread_map
 
 
+def rebuild_and_persist_dashboard_locked() -> str:
+    html = render_dashboard_html(
+        LATEST_RESULTS,
+        LATEST_MT5_OK,
+        LATEST_UPDATED_AT,
+        LATEST_SR,
+        LATEST_SPREAD,
+        ACTIVE_PAIRS,
+    )
+    LATEST_HTML_REF = html
+    write_dashboard_atomically(html)
+    return LATEST_HTML_REF
+
+
+class DashboardRequestHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        global LATEST_HTML
+        path_only = self.path.split("?", 1)[0]
+        if path_only in ("/", "/index.html", "/forex_dashboard.html"):
+            with STATE_LOCK:
+                html_str = LATEST_HTML
+            if not html_str:
+                html_str = "<!doctype html><html><body>Chargement...</body></html>"
+            body = html_str.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path_only == "/api/pairs":
+            with STATE_LOCK:
+                pairs_copy = list(ACTIVE_PAIRS)
+            self._send_json(200, {"ok": True, "pairs": pairs_copy, "maxPairs": MAX_ACTIVE_PAIRS})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        global ACTIVE_PAIRS, LATEST_HTML, LATEST_MT5_OK, LATEST_UPDATED_AT
+        path_only = self.path.split("?", 1)[0]
+        if path_only != "/api/pairs":
+            self._send_json(404, {"ok": False, "error": "Route inconnue"})
+            return
+
+        try:
+            content_len = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_len = 0
+        raw_body = self.rfile.read(max(0, min(content_len, 65536))) if content_len > 0 else b"{}"
+        try:
+            req = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "JSON invalide"})
+            return
+
+        action = str(req.get("action", "")).strip().lower()
+        symbol = normalize_symbol(str(req.get("symbol", "")))
+
+        if action == "remove":
+            with STATE_LOCK:
+                if len(ACTIVE_PAIRS) <= 1:
+                    self._send_json(400, {"ok": False, "error": "Impossible de supprimer la dernière paire active."})
+                    return
+                if symbol not in ACTIVE_PAIRS:
+                    self._send_json(404, {"ok": False, "error": f"Paire introuvable : {symbol}"})
+                    return
+                ACTIVE_PAIRS = [p for p in ACTIVE_PAIRS if p != symbol]
+                LATEST_RESULTS.pop(symbol, None)
+                LATEST_SR.pop(symbol, None)
+                LATEST_SPREAD.pop(symbol, None)
+                save_pairs_config(ACTIVE_PAIRS)
+                LATEST_UPDATED_AT = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                LATEST_HTML = rebuild_and_persist_dashboard_locked()
+                pairs_copy = list(ACTIVE_PAIRS)
+            print(f"[PAIRES] Paire supprimée : {symbol} -> {pairs_copy}")
+            self._send_json(200, {"ok": True, "action": "remove", "symbol": symbol, "pairs": pairs_copy})
+            return
+
+        if action == "add":
+            if not symbol or not is_valid_trading_symbol(symbol):
+                self._send_json(400, {"ok": False, "error": "Symbole invalide (ex: EURJPYm ou XAUUSDm)."})
+                return
+            with STATE_LOCK:
+                if len(ACTIVE_PAIRS) >= MAX_ACTIVE_PAIRS:
+                    self._send_json(400, {"ok": False, "error": f"Limite atteinte ({MAX_ACTIVE_PAIRS} paires max)."})
+                    return
+                if symbol in ACTIVE_PAIRS:
+                    self._send_json(400, {"ok": False, "error": f"{symbol} est déjà affiché."})
+                    return
+
+            # Vérifier dans MetaTrader 5 si connecté
+            mt5_ready = ensure_mt5_connected([symbol])
+            if mt5_ready and mt5 is not None:
+                selected_ok = mt5.symbol_select(symbol, True)
+                sym_info = mt5.symbol_info(symbol)
+                if not selected_ok or sym_info is None:
+                    self._send_json(
+                        400,
+                        {"ok": False, "error": f"Symbole introuvable dans MetaTrader 5 : {symbol}"},
+                    )
+                    return
+
+            # Calcul immédiat des 6 timeframes + S/R + Spread avant de recharger le navigateur
+            new_tf_results: Dict[str, Optional[Dict[str, Any]]] = {}
+            new_sr: Optional[Dict[str, Any]] = None
+            new_spread: Optional[float] = None
+            if mt5_ready:
+                for tf in TIMEFRAMES:
+                    try:
+                        new_tf_results[tf] = analyze_pair_timeframe(symbol, tf)
+                    except Exception as exc:
+                        print(f"[ERREUR] Calcul {symbol} {tf} : {exc}")
+                        new_tf_results[tf] = None
+                new_sr = compute_sr_map([symbol]).get(symbol)
+                new_spread = compute_spread_map([symbol]).get(symbol)
+
+            with STATE_LOCK:
+                if symbol not in ACTIVE_PAIRS:
+                    ACTIVE_PAIRS.append(symbol)
+                LATEST_RESULTS[symbol] = new_tf_results
+                LATEST_SR[symbol] = new_sr
+                LATEST_SPREAD[symbol] = new_spread
+                LATEST_MT5_OK = mt5_ready
+                save_pairs_config(ACTIVE_PAIRS)
+                LATEST_UPDATED_AT = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                LATEST_HTML = rebuild_and_persist_dashboard_locked()
+                pairs_copy = list(ACTIVE_PAIRS)
+            print(f"[PAIRES] Paire ajoutée : {symbol} -> {pairs_copy}")
+            self._send_json(200, {"ok": True, "action": "add", "symbol": symbol, "pairs": pairs_copy})
+            return
+
+        self._send_json(400, {"ok": False, "error": "Action invalide (attendu : add ou remove)."})
+
+
+def start_local_http_server() -> Tuple[Optional[ThreadingHTTPServer], Optional[int]]:
+    for port in range(HTTP_PORT_START, HTTP_PORT_END + 1):
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", port), DashboardRequestHandler)
+            srv.daemon_threads = True
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            return srv, port
+        except OSError:
+            continue
+    return None, None
+
+
 def main() -> None:
+    global HTTP_SERVER, LATEST_MT5_OK, LATEST_UPDATED_AT, LATEST_HTML
     print("=== Forex Agent Dashboard (Exness MT5) ===")
     print(f"Serveur MT5 cible : {MT5_SERVER}")
     print(f"Fichier dashboard : {DASHBOARD_HTML_PATH}")
+    print(f"Paires actives    : {', '.join(ACTIVE_PAIRS)}")
 
     now_sec = int(time.time())
     targets = {tf: get_next_target_epoch_sec(tf, now_sec) for tf in TIMEFRAMES}
-    results: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {p: {} for p in PAIRS}
-    sr_by_pair: Dict[str, Optional[Dict[str, Any]]] = {p: None for p in PAIRS}
-    spread_by_pair: Dict[str, Optional[float]] = {p: None for p in PAIRS}
 
     # Calcul initial complet des 6 timeframes
-    mt5_ok = ensure_mt5_connected()
+    with STATE_LOCK:
+        initial_pairs = list(ACTIVE_PAIRS)
+    mt5_ok = ensure_mt5_connected(initial_pairs)
+    init_results: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {p: {} for p in initial_pairs}
+    init_sr: Dict[str, Optional[Dict[str, Any]]] = {p: None for p in initial_pairs}
+    init_spread: Dict[str, Optional[float]] = {p: None for p in initial_pairs}
+
     if mt5_ok:
-        for pair in PAIRS:
+        for pair in initial_pairs:
             for tf in TIMEFRAMES:
                 try:
-                    results[pair][tf] = analyze_pair_timeframe(pair, tf)
+                    init_results[pair][tf] = analyze_pair_timeframe(pair, tf)
                 except Exception as exc:
                     print(f"[ERREUR] Calcul {pair} {tf} : {exc}")
-                    results[pair][tf] = None
-        sr_by_pair = compute_sr_map()
-        spread_by_pair = compute_spread_map()
+                    init_results[pair][tf] = None
+        init_sr = compute_sr_map(initial_pairs)
+        init_spread = compute_spread_map(initial_pairs)
     else:
         print("[AVERTISSEMENT] MetaTrader 5 injoignable -> affichage WAIT partout.")
 
-    updated_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    write_dashboard_atomically(
-        render_dashboard_html(results, mt5_ok, updated_str, sr_by_pair, spread_by_pair)
-    )
-    url = DASHBOARD_HTML_PATH.resolve().as_uri()
+    with STATE_LOCK:
+        for pair in initial_pairs:
+            if pair in ACTIVE_PAIRS:
+                LATEST_RESULTS[pair] = init_results.get(pair, {})
+                LATEST_SR[pair] = init_sr.get(pair)
+                LATEST_SPREAD[pair] = init_spread.get(pair)
+        LATEST_MT5_OK = mt5_ok
+        LATEST_UPDATED_AT = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        LATEST_HTML = rebuild_and_persist_dashboard_locked()
+
+    srv, http_port = start_local_http_server()
+    HTTP_SERVER = srv
+    if srv is not None and http_port is not None:
+        url = f"http://127.0.0.1:{http_port}/"
+        print(f"[SERVEUR LOCAL] Dashboard interactif actif sur : {url}")
+    else:
+        url = DASHBOARD_HTML_PATH.resolve().as_uri()
+        print(f"[AVERTISSEMENT] Ports {HTTP_PORT_START}-{HTTP_PORT_END} occupés, repli sur fichier : {url}")
+
     print(f"[NAVIGATEUR] Ouverture automatique : {url}")
     webbrowser.open(url)
 
-    while RUNNING:
-        time.sleep(0.25)
-        cur_sec = int(time.time())
-        due_tfs = [tf for tf in TIMEFRAMES if cur_sec >= targets[tf]]
-        if not due_tfs:
-            continue
+    try:
+        while RUNNING:
+            time.sleep(0.25)
+            cur_sec = int(time.time())
+            due_tfs = [tf for tf in TIMEFRAMES if cur_sec >= targets[tf]]
+            if not due_tfs:
+                continue
 
-        for tf in due_tfs:
-            targets[tf] = get_next_target_epoch_sec(tf, cur_sec)
+            for tf in due_tfs:
+                targets[tf] = get_next_target_epoch_sec(tf, cur_sec)
 
-        mt5_ok = ensure_mt5_connected()
-        if mt5_ok:
-            for pair in PAIRS:
-                for tf in due_tfs:
-                    try:
-                        results[pair][tf] = analyze_pair_timeframe(pair, tf)
-                    except Exception as exc:
-                        print(f"[ERREUR] Calcul {pair} {tf} : {exc}")
-                        results[pair][tf] = None
-            sr_by_pair = compute_sr_map()
-            spread_by_pair = compute_spread_map()
+            with STATE_LOCK:
+                cycle_pairs = list(ACTIVE_PAIRS)
 
-        updated_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        write_dashboard_atomically(
-            render_dashboard_html(results, mt5_ok, updated_str, sr_by_pair, spread_by_pair)
-        )
-        print(f"[CYCLE] MAJ {', '.join(due_tfs)} effectuée à {updated_str} (MT5={'OK' if mt5_ok else 'WAIT'})")
+            mt5_ok = ensure_mt5_connected(cycle_pairs)
+            cycle_updates: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {p: {} for p in cycle_pairs}
+            cycle_sr: Dict[str, Optional[Dict[str, Any]]] = {p: None for p in cycle_pairs}
+            cycle_spread: Dict[str, Optional[float]] = {p: None for p in cycle_pairs}
+
+            if mt5_ok:
+                for pair in cycle_pairs:
+                    for tf in due_tfs:
+                        try:
+                            cycle_updates[pair][tf] = analyze_pair_timeframe(pair, tf)
+                        except Exception as exc:
+                            print(f"[ERREUR] Calcul {pair} {tf} : {exc}")
+                            cycle_updates[pair][tf] = None
+                cycle_sr = compute_sr_map(cycle_pairs)
+                cycle_spread = compute_spread_map(cycle_pairs)
+
+            updated_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            with STATE_LOCK:
+                if mt5_ok:
+                    for pair in cycle_pairs:
+                        if pair in ACTIVE_PAIRS:
+                            LATEST_RESULTS.setdefault(pair, {}).update(cycle_updates.get(pair, {}))
+                            LATEST_SR[pair] = cycle_sr.get(pair)
+                            LATEST_SPREAD[pair] = cycle_spread.get(pair)
+                LATEST_MT5_OK = mt5_ok
+                LATEST_UPDATED_AT = updated_str
+                LATEST_HTML = rebuild_and_persist_dashboard_locked()
+            print(f"[CYCLE] MAJ {', '.join(due_tfs)} effectuée à {updated_str} (MT5={'OK' if mt5_ok else 'WAIT'})")
+    finally:
+        if HTTP_SERVER is not None:
+            try:
+                HTTP_SERVER.shutdown()
+                HTTP_SERVER.server_close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

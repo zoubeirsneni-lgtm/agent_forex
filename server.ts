@@ -8,8 +8,12 @@ import {
   analyzeTimeframe,
   type Candle,
   computeSupportResistance,
+  DEFAULT_PAIRS,
   type ForexPair,
-  PAIRS,
+  getPipSize,
+  isValidTradingSymbol,
+  MAX_ACTIVE_PAIRS,
+  normalizeSymbolInput,
   type PivotHtf,
   type SupportResistanceInfo,
   TIMEFRAMES,
@@ -21,26 +25,48 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
 
-const YAHOO_SYMBOL: Record<ForexPair, string> = {
-  EURUSDm: 'EURUSD=X',
-  GBPUSDm: 'GBPUSD=X',
-  USDJPYm: 'JPY=X',
-  AUDUSDm: 'AUDUSD=X',
+const KNOWN_MARKET_META: Record<string, { spot: number; spreadPips: number; yahoo: string }> = {
+  EURUSDm: { spot: 1.0842, spreadPips: 0.7, yahoo: 'EURUSD=X' },
+  GBPUSDm: { spot: 1.2678, spreadPips: 1.0, yahoo: 'GBPUSD=X' },
+  USDJPYm: { spot: 153.45, spreadPips: 0.8, yahoo: 'JPY=X' },
+  AUDUSDm: { spot: 0.6548, spreadPips: 1.1, yahoo: 'AUDUSD=X' },
+  USDCADm: { spot: 1.3895, spreadPips: 1.1, yahoo: 'CAD=X' },
+  USDCHFm: { spot: 0.8785, spreadPips: 1.1, yahoo: 'CHF=X' },
+  NZDUSDm: { spot: 0.5975, spreadPips: 1.3, yahoo: 'NZDUSD=X' },
+  EURJPYm: { spot: 166.35, spreadPips: 1.3, yahoo: 'EURJPY=X' },
+  GBPJPYm: { spot: 194.55, spreadPips: 1.8, yahoo: 'GBPJPY=X' },
+  EURGBPm: { spot: 0.8552, spreadPips: 0.9, yahoo: 'EURGBP=X' },
+  AUDJPYm: { spot: 100.45, spreadPips: 1.4, yahoo: 'AUDJPY=X' },
+  XAUUSDm: { spot: 2685.0, spreadPips: 2.0, yahoo: 'GC=F' },
 };
 
-const BASE_SPOT: Record<ForexPair, number> = {
-  EURUSDm: 1.0842,
-  GBPUSDm: 1.2678,
-  USDJPYm: 153.45,
-  AUDUSDm: 0.6548,
-};
+function getYahooSymbol(pair: ForexPair): string {
+  const known = KNOWN_MARKET_META[pair];
+  if (known) return known.yahoo;
+  const upper = pair.toUpperCase();
+  if (upper.includes('XAU') || upper.includes('GOLD')) return 'GC=F';
+  const base6 = upper.replace(/M$/, '').slice(0, 6);
+  if (/^[A-Z]{6}$/.test(base6)) {
+    if (base6.startsWith('USD')) {
+      return `${base6.slice(3)}=X`;
+    }
+    return `${base6}=X`;
+  }
+  return `${upper}=X`;
+}
 
-const BASE_SPREAD_PIPS: Record<ForexPair, number> = {
-  EURUSDm: 0.7,
-  GBPUSDm: 1.0,
-  USDJPYm: 0.8,
-  AUDUSDm: 1.1,
-};
+function getDefaultSpotAndSpread(pair: ForexPair): { spot: number; spreadPips: number } {
+  const known = KNOWN_MARKET_META[pair];
+  if (known) return { spot: known.spot, spreadPips: known.spreadPips };
+  const upper = pair.toUpperCase();
+  if (upper.includes('XAU') || upper.includes('GOLD')) {
+    return { spot: 2685.0, spreadPips: 2.0 };
+  }
+  if (upper.includes('JPY')) {
+    return { spot: 155.0, spreadPips: 1.4 };
+  }
+  return { spot: 1.1, spreadPips: 1.2 };
+}
 
 const TF_SECONDS: Record<(typeof TIMEFRAMES)[number], number> = {
   '30s': 30,
@@ -66,16 +92,12 @@ interface PairMarketState {
   drift: number;
 }
 
-const marketStore: Record<ForexPair, PairMarketState> = {} as Record<ForexPair, PairMarketState>;
-
-function pipSize(pair: ForexPair): number {
-  return pair === 'USDJPYm' ? 0.01 : 0.0001;
-}
+const marketStore: Record<string, PairMarketState> = {};
 
 function generateInitialSeries(pair: ForexPair, spot: number, stepSec: number, count: number): Candle[] {
   const nowSec = Math.floor(Date.now() / 1000);
   const alignedEnd = nowSec - (nowSec % stepSec);
-  const pip = pipSize(pair);
+  const pip = getPipSize(pair);
   const volScale = Math.sqrt(stepSec / 60);
   const candles: Candle[] = new Array(count);
 
@@ -110,34 +132,40 @@ function generateInitialSeries(pair: ForexPair, spot: number, stepSec: number, c
   return candles;
 }
 
+function ensurePairMarketState(pair: ForexPair): PairMarketState {
+  if (marketStore[pair]) return marketStore[pair];
+  const { spot } = getDefaultSpotAndSpread(pair);
+  const tfCandles = {} as Record<(typeof TIMEFRAMES)[number], Candle[]>;
+  for (const tf of TIMEFRAMES) {
+    tfCandles[tf] = generateInitialSeries(pair, spot, TF_SECONDS[tf], 300);
+  }
+  const pip = getPipSize(pair);
+  const htfCandles: Record<PivotHtf, { high: number; low: number; close: number }> = {
+    M15: { high: spot + pip * 14, low: spot - pip * 12, close: spot - pip * 2 },
+    H1: { high: spot + pip * 28, low: spot - pip * 24, close: spot + pip * 3 },
+    H4: { high: spot + pip * 52, low: spot - pip * 46, close: spot - pip * 5 },
+    D1: { high: spot + pip * 85, low: spot - pip * 78, close: spot + pip * 11 },
+  };
+  marketStore[pair] = {
+    spot,
+    lastYahooSync: 0,
+    tfCandles,
+    htfCandles,
+    drift: (Math.random() - 0.5) * 0.3,
+  };
+  return marketStore[pair];
+}
+
 function initMarketStore() {
-  for (const pair of PAIRS) {
-    const spot = BASE_SPOT[pair];
-    const tfCandles = {} as Record<(typeof TIMEFRAMES)[number], Candle[]>;
-    for (const tf of TIMEFRAMES) {
-      tfCandles[tf] = generateInitialSeries(pair, spot, TF_SECONDS[tf], 120);
-    }
-    const pip = pipSize(pair);
-    const htfCandles: Record<PivotHtf, { high: number; low: number; close: number }> = {
-      M15: { high: spot + pip * 14, low: spot - pip * 12, close: spot - pip * 2 },
-      H1: { high: spot + pip * 28, low: spot - pip * 24, close: spot + pip * 3 },
-      H4: { high: spot + pip * 52, low: spot - pip * 46, close: spot - pip * 5 },
-      D1: { high: spot + pip * 85, low: spot - pip * 78, close: spot + pip * 11 },
-    };
-    marketStore[pair] = {
-      spot,
-      lastYahooSync: 0,
-      tfCandles,
-      htfCandles,
-      drift: (Math.random() - 0.5) * 0.3,
-    };
+  for (const pair of DEFAULT_PAIRS) {
+    ensurePairMarketState(pair);
   }
 }
 
 initMarketStore();
 
 async function fetchYahooChart(pair: ForexPair): Promise<{ spot: number; candles1m?: Candle[] } | null> {
-  const symbol = YAHOO_SYMBOL[pair];
+  const symbol = getYahooSymbol(pair);
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1m&range=1d`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3500);
@@ -181,7 +209,7 @@ async function fetchYahooChart(pair: ForexPair): Promise<{ spot: number; candles
         : 0;
 
     if (spot <= 0) return null;
-    return { spot, candles1m: candles1m.length >= 60 ? candles1m.slice(-120) : undefined };
+    return { spot, candles1m: candles1m.length >= 60 ? candles1m.slice(-300) : undefined };
   } catch {
     return null;
   } finally {
@@ -190,10 +218,10 @@ async function fetchYahooChart(pair: ForexPair): Promise<{ spot: number; candles
 }
 
 async function advancePairMarket(pair: ForexPair): Promise<void> {
-  const state = marketStore[pair];
+  const state = ensurePairMarketState(pair);
   const nowMs = Date.now();
   const nowSec = Math.floor(nowMs / 1000);
-  const pip = pipSize(pair);
+  const pip = getPipSize(pair);
 
   // Sync with real Yahoo Finance FX feed at most every 30s
   if (nowMs - state.lastYahooSync > 30000) {
@@ -240,7 +268,7 @@ async function advancePairMarket(pair: ForexPair): Promise<void> {
         tickVolume: tickBump,
       };
       list.push(newCandle);
-      if (list.length > 140) list.shift();
+      if (list.length > 300) list.shift();
     } else {
       last.close = state.spot;
       last.high = Math.max(last.high, state.spot);
@@ -263,6 +291,20 @@ async function advancePairMarket(pair: ForexPair): Promise<void> {
   }
 }
 
+function parseRequestedPairs(rawPairs: unknown): ForexPair[] {
+  const raw = String(rawPairs || '').trim();
+  if (!raw) return [...DEFAULT_PAIRS];
+  const deduped: ForexPair[] = [];
+  for (const token of raw.split(',')) {
+    const sym = normalizeSymbolInput(token);
+    if (sym && isValidTradingSymbol(sym) && !deduped.includes(sym)) {
+      deduped.push(sym);
+      if (deduped.length >= MAX_ACTIVE_PAIRS) break;
+    }
+  }
+  return deduped.length > 0 ? deduped : [...DEFAULT_PAIRS];
+}
+
 async function startServer() {
   const app = express();
   const httpServer = http.createServer(app);
@@ -272,6 +314,7 @@ async function startServer() {
   app.get('/api/market-snapshot', async (req, res) => {
     const source = String(req.query.source || 'live');
     const bridgeUrl = String(req.query.bridgeUrl || '').trim();
+    const targetPairs = parseRequestedPairs(req.query.pairs);
     const updatedAt = new Date().toLocaleString('fr-FR', {
       day: '2-digit',
       month: '2-digit',
@@ -295,9 +338,11 @@ async function startServer() {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 3500);
       try {
-        const bridgeRes = await fetch(`${bridgeUrl.replace(/\/$/, '')}/snapshot`, {
-          signal: controller.signal,
-        });
+        const bridgeUrlClean = bridgeUrl.replace(/\/$/, '');
+        const bridgeRes = await fetch(
+          `${bridgeUrlClean}/snapshot?pairs=${encodeURIComponent(targetPairs.join(','))}`,
+          { signal: controller.signal }
+        );
         if (!bridgeRes.ok) throw new Error(`HTTP ${bridgeRes.status}`);
         const bridgeData = await bridgeRes.json();
         res.json({ ok: true, ...bridgeData, updatedAt });
@@ -324,20 +369,14 @@ async function startServer() {
       : [...TIMEFRAMES];
     const targetTfs = requestedTfs.length > 0 ? requestedTfs : [...TIMEFRAMES];
 
-    await Promise.all(PAIRS.map((pair) => advancePairMarket(pair)));
+    await Promise.all(targetPairs.map((pair) => advancePairMarket(pair)));
 
-    const analysisByPair: Record<ForexPair, TimeframeAnalysis[]> = {} as Record<ForexPair, TimeframeAnalysis[]>;
-    const priceHistoryByPair: Record<ForexPair, { time: string; price: number }[]> = {} as Record<
-      ForexPair,
-      { time: string; price: number }[]
-    >;
-    const supportResistanceByPair: Record<ForexPair, SupportResistanceInfo> = {} as Record<
-      ForexPair,
-      SupportResistanceInfo
-    >;
-    const spreadByPair: Record<ForexPair, number> = {} as Record<ForexPair, number>;
-    for (const pair of PAIRS) {
-      const state = marketStore[pair];
+    const analysisByPair: Record<ForexPair, TimeframeAnalysis[]> = {};
+    const priceHistoryByPair: Record<ForexPair, { time: string; price: number }[]> = {};
+    const supportResistanceByPair: Record<ForexPair, SupportResistanceInfo> = {};
+    const spreadByPair: Record<ForexPair, number> = {};
+    for (const pair of targetPairs) {
+      const state = ensurePairMarketState(pair);
       analysisByPair[pair] = targetTfs.map((tf) => {
         const candles = state.tfCandles[tf];
         const htfCandle = state.htfCandles[
@@ -367,8 +406,9 @@ async function startServer() {
         state.htfCandles.H1,
         state.htfCandles.H4
       );
+      const baseMeta = getDefaultSpotAndSpread(pair);
       spreadByPair[pair] = Number(
-        Math.max(0.4, BASE_SPREAD_PIPS[pair] + (Math.random() - 0.5) * 0.4).toFixed(1)
+        Math.max(0.4, baseMeta.spreadPips + (Math.random() - 0.5) * 0.4).toFixed(1)
       );
     }
 

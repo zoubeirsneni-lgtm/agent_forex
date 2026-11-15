@@ -1,0 +1,474 @@
+// ============================================================================
+// NEXT CANDLE PREDICTOR V4.1
+// Rule-Based Multi-Factor Confluence Edition
+// The displayed percentages are normalized directional confluence scores.
+// They are not statistical probabilities, expected win rates, or guarantees.
+// Estimated Volume Pressure is derived from OHLCV data and is not bid/ask delta.
+// ============================================================================
+// 
+// V4.1 TERMINOLOGY AND PRESENTATION UPDATE:
+// Strong Setup status requires directional pressure confirmation
+// ATR regime badge clarified for easier interpretation
+//
+// CORE COMPONENTS:
+// Custom Supertrend implementation
+// Estimated Volume Pressure component (15% weight)
+// RSI neutral-level confirmation
+// Stochastic momentum confirmation
+// ADX trend-strength threshold
+// 8-point confluence framework
+// Volatility regime classification (HIGH/MEDIUM/LOW)
+// Volatility-aware score adjustment
+// Enhanced Strong Setup conditions
+//
+// AUTHOR:
+// - Developed by Ceyhun C. Canbazoglu
+
+
+//
+// ============================================================================
+
+//@version=6
+indicator("Next Candle Predictor", overlay=true, max_boxes_count=100, max_lines_count=100, max_labels_count=100)
+// ============================================================================
+// INPUT SETTINGS
+// ============================================================================
+
+grp_main = "Main Settings"
+atrLength = input.int(14, "ATR Period", minval=5, maxval=50, group=grp_main)
+stFactor = input.float(3.0, "Trend Factor", minval=1.0, maxval=5.0, step=0.1, group=grp_main)
+stPeriod = input.int(10, "Trend ATR Period", minval=5, maxval=30, group=grp_main)
+
+grp_confluence = "Confluence Settings"
+minConfluence = input.int(5, "Minimum Confluence Score (1-8)", minval=3, maxval=8, group=grp_confluence, tooltip="Eight-point confluence framework; higher values require broader agreement")
+minVolumeRatio = input.float(0.8, "Minimum Volume Ratio", minval=0.5, maxval=2.0, step=0.1, group=grp_confluence)
+adxThreshold = input.int(25, "ADX Trend Threshold", minval=15, maxval=40, group=grp_confluence, tooltip="ADX threshold used to filter weaker trend conditions")
+
+grp_vis = "Visual Settings"
+showTable = input.bool(true, "Show Analysis Table", group=grp_vis)
+showProjection = input.bool(true, "Show Directional Scenario Candles", group=grp_vis)
+showTrendFill = input.bool(true, "Show Trend Background Fill", group=grp_vis)
+
+// ============================================================================
+// COLORS
+// ============================================================================
+
+colLong = #089981
+colShort = #f23645
+colFTBackground = #FCD0AF
+colBg = #1e222d
+colBgDark = #131722
+colBlack = #000000
+colText = #ffffff
+colGray = #787b86
+colYellow = #f0b90b
+colOrange = #ff9800
+
+// ============================================================================
+// CUSTOM SUPERTREND IMPLEMENTATION
+// ============================================================================
+
+trendAtr = ta.atr(stPeriod)
+hl2Value = (high + low) / 2
+upperBandRaw = hl2Value + (stFactor * trendAtr)
+lowerBandRaw = hl2Value - (stFactor * trendAtr)
+
+var float upperBand = na
+var float lowerBand = na
+var int trendDirection = 1
+
+prevUpperBand = nz(upperBand[1], upperBandRaw)
+prevLowerBand = nz(lowerBand[1], lowerBandRaw)
+prevDirection = nz(trendDirection[1], 1)
+
+lowerBand := close[1] > prevLowerBand ? math.max(lowerBandRaw, prevLowerBand) : lowerBandRaw
+upperBand := close[1] < prevUpperBand ? math.min(upperBandRaw, prevUpperBand) : upperBandRaw
+
+if prevDirection == -1
+    trendDirection := close < lowerBand ? 1 : -1
+else
+    trendDirection := close > upperBand ? -1 : 1
+
+trendLine = trendDirection == -1 ? lowerBand : upperBand
+
+isUptrend = trendDirection == -1
+isDowntrend = trendDirection == 1
+trendChanged = trendDirection != trendDirection[1]
+
+// ============================================================================
+// ESTIMATED VOLUME PRESSURE
+// ============================================================================
+
+candleRange = high - low
+buyVolume = candleRange > 0 ? volume * (close - low) / candleRange : volume * 0.5
+sellVolume = candleRange > 0 ? volume * (high - close) / candleRange : volume * 0.5
+volumeDelta = buyVolume - sellVolume
+
+deltaEma = ta.ema(volumeDelta, 10)
+deltaMomentum = volumeDelta > deltaEma
+
+deltaBullish = volumeDelta > 0
+deltaBearish = volumeDelta < 0
+
+// ============================================================================
+// STANDARD TECHNICAL INDICATORS
+// ============================================================================
+
+atr = ta.atr(atrLength)
+
+ema8 = ta.ema(close, 8)
+ema21 = ta.ema(close, 21)
+ema50 = ta.ema(close, 50)
+
+rsi = ta.rsi(close, 14)
+rsiAbove50 = rsi > 50
+rsiBelow50 = rsi < 50
+
+[macdLine, signalLine, macdHist] = ta.macd(close, 12, 26, 9)
+
+stochK = ta.stoch(close, high, low, 14)
+stochD = ta.sma(stochK, 3)
+stochAbove50 = stochK > 50
+stochBelow50 = stochK < 50
+
+volSma = ta.sma(volume, 20)
+volRatio = nz(volume / volSma, 1.0)
+avgBody = ta.sma(math.abs(close - open), 5)
+
+adxLen = 14
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxLen)
+
+bbMid = ta.sma(close, 20)
+bbStd = ta.stdev(close, 20)
+bbWidth = bbStd * 2 / bbMid * 100
+
+// ============================================================================
+// VOLATILITY REGIME DETECTION
+// ============================================================================
+
+atrPercentile = ta.percentrank(atr, 100)
+volRegime = atrPercentile > 75 ? "HIGH" : atrPercentile < 25 ? "LOW" : "MEDIUM"
+
+volMultiplier = atrPercentile > 75 ? 0.85 : atrPercentile < 25 ? 1.15 : 1.0
+
+// ============================================================================
+// DYNAMIC THRESHOLD (ADX Based)
+// ============================================================================
+
+dynamicThreshold = adxValue > 30 ? 55 : adxValue > 25 ? 60 : adxValue > 20 ? 65 : 70
+
+// ============================================================================
+// SCORING SYSTEM
+// ============================================================================
+
+macdScoreLong = macdLine > signalLine and macdHist > 0 ? 100 : macdLine > signalLine ? 70 : macdHist > 0 ? 50 : 20
+macdScoreShort = macdLine < signalLine and macdHist < 0 ? 100 : macdLine < signalLine ? 70 : macdHist < 0 ? 50 : 20
+
+rsiScoreLong = rsi < 30 ? 100 : rsi < 40 ? 85 : rsi < 50 ? 70 : rsi < 60 ? 50 : 25
+rsiScoreShort = rsi > 70 ? 100 : rsi > 60 ? 85 : rsi > 50 ? 70 : rsi > 40 ? 50 : 25
+
+stochScoreLong = stochK > stochD and stochK < 20 ? 100 : stochK > stochD and stochK < 50 ? 85 : stochK > stochD ? 65 : 25
+stochScoreShort = stochK < stochD and stochK > 80 ? 100 : stochK < stochD and stochK > 50 ? 85 : stochK < stochD ? 65 : 25
+
+volScore = volRatio > 2.0 ? 100 : volRatio > 1.5 ? 80 : volRatio > 1.0 ? 60 : volRatio > 0.8 ? 45 : 25
+
+deltaScoreLong = volumeDelta > 0 and deltaMomentum ? 100 : volumeDelta > 0 ? 75 : volumeDelta > -math.abs(deltaEma) ? 40 : 20
+deltaScoreShort = volumeDelta < 0 and not deltaMomentum ? 100 : volumeDelta < 0 ? 75 : volumeDelta < math.abs(deltaEma) ? 40 : 20
+
+adxScore = adxValue > 35 ? 100 : adxValue > 30 ? 85 : adxValue > 25 ? 70 : adxValue > 20 ? 50 : 30
+
+trendScoreLong = isUptrend and ema8 > ema21 and ema21 > ema50 ? 100 : isUptrend and ema8 > ema21 ? 80 : isUptrend ? 60 : 0
+trendScoreShort = isDowntrend and ema8 < ema21 and ema21 < ema50 ? 100 : isDowntrend and ema8 < ema21 ? 80 : isDowntrend ? 60 : 0
+
+longScoreRaw = (trendScoreLong * 0.23) + (macdScoreLong * 0.18) + (deltaScoreLong * 0.15) + (rsiScoreLong * 0.12) + (stochScoreLong * 0.12) + (adxScore * 0.10) + (volScore * 0.10)
+shortScoreRaw = (trendScoreShort * 0.23) + (macdScoreShort * 0.18) + (deltaScoreShort * 0.15) + (rsiScoreShort * 0.12) + (stochScoreShort * 0.12) + (adxScore * 0.10) + (volScore * 0.10)
+
+longScore = math.round(math.min(100, math.max(0, longScoreRaw * volMultiplier)))
+shortScore = math.round(math.min(100, math.max(0, shortScoreRaw * volMultiplier)))
+
+totalRaw = longScore + shortScore
+longPct = totalRaw > 0 ? math.round(longScore / totalRaw * 100) : 50
+shortPct = 100 - longPct
+
+// ============================================================================
+// 8-POINT CONFLUENCE SYSTEM
+// ============================================================================
+
+confluenceLong = 0
+confluenceLong += isUptrend ? 1 : 0
+confluenceLong += ema8 > ema21 ? 1 : 0
+confluenceLong += macdLine > signalLine ? 1 : 0
+confluenceLong += stochK > stochD ? 1 : 0
+confluenceLong += volRatio >= minVolumeRatio ? 1 : 0
+confluenceLong += adxValue > adxThreshold ? 1 : 0
+confluenceLong += rsiAbove50 ? 1 : 0
+confluenceLong += deltaBullish ? 1 : 0
+
+confluenceShort = 0
+confluenceShort += isDowntrend ? 1 : 0
+confluenceShort += ema8 < ema21 ? 1 : 0
+confluenceShort += macdLine < signalLine ? 1 : 0
+confluenceShort += stochK < stochD ? 1 : 0
+confluenceShort += volRatio >= minVolumeRatio ? 1 : 0
+confluenceShort += adxValue > adxThreshold ? 1 : 0
+confluenceShort += rsiBelow50 ? 1 : 0
+confluenceShort += deltaBearish ? 1 : 0
+
+volumeOk = volRatio >= minVolumeRatio
+
+// ============================================================================
+// STRONG SETUP - DIRECTIONAL PRESSURE CONFIRMATION
+// ============================================================================
+// Directional pressure must agree with the selected setup direction
+// This is a rule-based confirmation condition, not a probability forecast
+
+longPerfect = isUptrend and longPct >= dynamicThreshold and confluenceLong >= minConfluence and volumeOk and rsiAbove50 and deltaBullish
+shortPerfect = isDowntrend and shortPct >= dynamicThreshold and confluenceShort >= minConfluence and volumeOk and rsiBelow50 and deltaBearish
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+getAsciiBar(score) =>
+    filled = math.round(score / 10)
+    filled := math.max(0, math.min(10, filled))
+    "[" + str.repeat("█", filled) + str.repeat("░", 10 - filled) + "]"
+
+getMacdText(isLongParam) =>
+    if isLongParam
+        macdLine > signalLine and macdHist > 0 ? "Bullish ✓" : macdLine > signalLine ? "Bullish" : "Bearish"
+    else
+        macdLine < signalLine and macdHist < 0 ? "Bearish ✓" : macdLine < signalLine ? "Bearish" : "Bullish"
+
+getRsiText() =>
+    arrow = rsi > 50 ? "↑" : "↓"
+    "(" + str.tostring(math.round(rsi)) + ") " + arrow
+
+getStochText(isLongParam) =>
+    arrow = stochK > 50 ? "↑" : "↓"
+    if isLongParam
+        stochK < 20 ? "Oversold " + arrow : stochK > stochD ? "Bullish " + arrow : "Bearish " + arrow
+    else
+        stochK > 80 ? "Overbought " + arrow : stochK < stochD ? "Bearish " + arrow : "Bullish " + arrow
+
+getVolText() =>
+    str.tostring(math.round(volRatio, 1)) + "x"
+
+getDeltaText(isLongParam) =>
+    if isLongParam
+        volumeDelta > 0 and deltaMomentum ? "Positive Pressure ⚡" : volumeDelta > 0 ? "Positive ↑" : "Negative ↓"
+    else
+        volumeDelta < 0 and not deltaMomentum ? "Negative Pressure ⚡" : volumeDelta < 0 ? "Negative ↓" : "Positive ↑"
+
+getTrendText(isLongParam) =>
+    if isLongParam
+        isUptrend and ema8 > ema21 ? "Strong Up ✓" : isUptrend ? "Up" : "Down"
+    else
+        isDowntrend and ema8 < ema21 ? "Strong Down ✓" : isDowntrend ? "Down" : "Up"
+
+getAdxText() =>
+    strength = adxValue > 30 ? "Strong" : adxValue > 25 ? "OK" : "Weak"
+    str.tostring(math.round(adxValue)) + " " + strength
+
+// ATR regime badge
+getVolRegimeIcon() =>
+    volRegime == "HIGH" ? "ATR: ⚡HIGH" : volRegime == "LOW" ? "ATR: 💤LOW" : "ATR: 📊NORM"
+
+// ============================================================================
+// ANALYSIS TABLE - V4.1 UI
+// ============================================================================
+
+var table analysisTable = table.new(position.top_right, 2, 21, bgcolor=colBgDark, border_width=0, frame_width=2, frame_color=colGray)
+
+if barstate.islast and showTable
+    // Header
+    table.cell(analysisTable, 0, 0, "NEXT CANDLE PREDICTOR", text_color=colYellow, bgcolor=colBgDark, text_size=size.small, text_halign=text.align_left)
+    table.cell(analysisTable, 1, 0, getVolRegimeIcon(), text_color=colText, bgcolor=colBgDark, text_size=size.small, text_halign=text.align_right)
+    
+    // ===== LONG SECTION =====
+    table.cell(analysisTable, 0, 1, "LONG ANALYSIS", text_color=colText, bgcolor=colLong, text_size=size.normal, text_halign=text.align_left)
+    table.cell(analysisTable, 1, 1, "DIRECTIONAL SCORE " + str.tostring(longPct) + "%", text_color=colText, bgcolor=colLong, text_size=size.normal, text_halign=text.align_right)
+    
+    // MACD
+    table.cell(analysisTable, 0, 2, "MACD", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    macdColorL = macdScoreLong >= 70 ? colLong : colGray
+    table.cell(analysisTable, 1, 2, getAsciiBar(macdScoreLong) + " " + getMacdText(true), text_color=macdColorL, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // RSI
+    table.cell(analysisTable, 0, 3, "RSI", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    rsiColorL = rsiScoreLong >= 60 ? colLong : colGray
+    table.cell(analysisTable, 1, 3, getAsciiBar(rsiScoreLong) + " " + getRsiText(), text_color=rsiColorL, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // STOCH
+    table.cell(analysisTable, 0, 4, "STOCH", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    stochColorL = stochScoreLong >= 70 ? colLong : colGray
+    table.cell(analysisTable, 1, 4, getAsciiBar(stochScoreLong) + " " + getStochText(true), text_color=stochColorL, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // VOLUME
+    table.cell(analysisTable, 0, 5, "VOLUME", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    volColor = volScore >= 60 ? colLong : colGray
+    table.cell(analysisTable, 1, 5, getAsciiBar(volScore) + " " + getVolText(), text_color=volColor, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // DELTA
+    table.cell(analysisTable, 0, 6, "EST. PRESSURE", text_color=colOrange, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    deltaColorL = deltaScoreLong >= 70 ? colLong : colGray
+    table.cell(analysisTable, 1, 6, getAsciiBar(deltaScoreLong) + " " + getDeltaText(true), text_color=deltaColorL, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // TREND
+    table.cell(analysisTable, 0, 7, "TREND", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    trendColorL = trendScoreLong >= 60 ? colLong : colGray
+    table.cell(analysisTable, 1, 7, getAsciiBar(trendScoreLong) + " " + getTrendText(true), text_color=trendColorL, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // ADX
+    table.cell(analysisTable, 0, 8, "ADX", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    adxColorL = adxScore >= 60 ? colLong : colGray
+    table.cell(analysisTable, 1, 8, getAsciiBar(adxScore) + " " + getAdxText(), text_color=adxColorL, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // CONFLUENCE
+    confLongColor = confluenceLong >= minConfluence ? colLong : colGray
+    table.cell(analysisTable, 0, 9, "CONFLUENCE", text_color=colYellow, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(analysisTable, 1, 9, str.tostring(confluenceLong) + " / 8", text_color=confLongColor, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // LONG STATUS
+    longStatusText = longPerfect ? "STRONG SETUP" : "WAIT"
+    longStatusColor = longPerfect ? colLong : colGray
+    table.cell(analysisTable, 0, 10, "LONG", text_color=colLong, bgcolor=colBlack, text_size=size.normal, text_halign=text.align_center)
+    table.cell(analysisTable, 1, 10, longStatusText, text_color=longStatusColor, bgcolor=colBlack, text_size=size.normal, text_halign=text.align_center)
+    
+    // ===== SHORT SECTION =====
+    table.cell(analysisTable, 0, 11, "SHORT ANALYSIS", text_color=colText, bgcolor=colShort, text_size=size.normal, text_halign=text.align_left)
+    table.cell(analysisTable, 1, 11, "DIRECTIONAL SCORE " + str.tostring(shortPct) + "%", text_color=colText, bgcolor=colShort, text_size=size.normal, text_halign=text.align_right)
+    
+    // MACD
+    table.cell(analysisTable, 0, 12, "MACD", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    macdColorS = macdScoreShort >= 70 ? colShort : colGray
+    table.cell(analysisTable, 1, 12, getAsciiBar(macdScoreShort) + " " + getMacdText(false), text_color=macdColorS, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // RSI
+    table.cell(analysisTable, 0, 13, "RSI", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    rsiColorS = rsiScoreShort >= 60 ? colShort : colGray
+    table.cell(analysisTable, 1, 13, getAsciiBar(rsiScoreShort) + " " + getRsiText(), text_color=rsiColorS, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // STOCH
+    table.cell(analysisTable, 0, 14, "STOCH", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    stochColorS = stochScoreShort >= 70 ? colShort : colGray
+    table.cell(analysisTable, 1, 14, getAsciiBar(stochScoreShort) + " " + getStochText(false), text_color=stochColorS, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // VOLUME
+    table.cell(analysisTable, 0, 15, "VOLUME", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(analysisTable, 1, 15, getAsciiBar(volScore) + " " + getVolText(), text_color=volColor, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // DELTA
+    table.cell(analysisTable, 0, 16, "EST. PRESSURE", text_color=colOrange, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    deltaColorS = deltaScoreShort >= 70 ? colShort : colGray
+    table.cell(analysisTable, 1, 16, getAsciiBar(deltaScoreShort) + " " + getDeltaText(false), text_color=deltaColorS, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // TREND
+    table.cell(analysisTable, 0, 17, "TREND", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    trendColorS = trendScoreShort >= 60 ? colShort : colGray
+    table.cell(analysisTable, 1, 17, getAsciiBar(trendScoreShort) + " " + getTrendText(false), text_color=trendColorS, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // ADX
+    table.cell(analysisTable, 0, 18, "ADX", text_color=colText, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    adxColorS = adxScore >= 60 ? colShort : colGray
+    table.cell(analysisTable, 1, 18, getAsciiBar(adxScore) + " " + getAdxText(), text_color=adxColorS, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // CONFLUENCE
+    confShortColor = confluenceShort >= minConfluence ? colShort : colGray
+    table.cell(analysisTable, 0, 19, "CONFLUENCE", text_color=colYellow, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    table.cell(analysisTable, 1, 19, str.tostring(confluenceShort) + " / 8", text_color=confShortColor, bgcolor=colBg, text_size=size.small, text_halign=text.align_left)
+    
+    // SHORT STATUS
+    shortStatusText = shortPerfect ? "STRONG SETUP" : "WAIT"
+    shortStatusColor = shortPerfect ? colShort : colGray
+    table.cell(analysisTable, 0, 20, "SHORT", text_color=colShort, bgcolor=colBlack, text_size=size.normal, text_halign=text.align_center)
+    table.cell(analysisTable, 1, 20, shortStatusText, text_color=shortStatusColor, bgcolor=colBlack, text_size=size.normal, text_halign=text.align_center)
+
+// ============================================================================
+// CUSTOM SUPERTREND LINE & FILL
+// ============================================================================
+
+stColor = isUptrend ? colLong : colShort
+stPlot = plot(trendLine, "NCP Trend", color=stColor, linewidth=2)
+
+bodyMiddle = (open + close) / 2
+bodyPlot = plot(showTrendFill ? bodyMiddle : na, "Body Middle", display=display.none)
+
+fill(bodyPlot, stPlot, color=isUptrend ? color.new(colLong, 85) : color.new(colShort, 85), title="Trend Fill")
+
+plotshape(trendChanged and isUptrend, "Trend → Up", shape.triangleup, location.belowbar, colLong, size=size.tiny)
+plotshape(trendChanged and isDowntrend, "Trend → Down", shape.triangledown, location.abovebar, colShort, size=size.tiny)
+
+// ============================================================================
+// DIRECTIONAL SCENARIO CANDLES
+// ============================================================================
+
+var line projDashLine = na
+var box projZoneBox = na
+var box longProjBody = na
+var line longProjWickUp = na
+var line longProjWickDown = na
+var label longProjLabel = na
+var box shortProjBody = na
+var line shortProjWickUp = na
+var line shortProjWickDown = na
+var label shortProjLabel = na
+
+if barstate.islast and showProjection
+    line.delete(projDashLine)
+    box.delete(projZoneBox)
+    box.delete(longProjBody)
+    line.delete(longProjWickUp)
+    line.delete(longProjWickDown)
+    label.delete(longProjLabel)
+    box.delete(shortProjBody)
+    line.delete(shortProjWickUp)
+    line.delete(shortProjWickDown)
+    label.delete(shortProjLabel)
+    
+    zoneTop = ta.highest(high, 30) + atr * 1.5
+    zoneBottom = ta.lowest(low, 30) - atr * 1.5
+    
+    projDashLine := line.new(bar_index + 1, zoneTop, bar_index + 1, zoneBottom, color=colGray, width=1, style=line.style_dashed)
+    projZoneBox := box.new(bar_index + 1, zoneTop, bar_index + 8, zoneBottom, bgcolor=color.new(colFTBackground, 70), border_color=color.new(colFTBackground, 50), border_width=1)
+    
+    volMult = volRegime == "HIGH" ? 1.5 : volRegime == "LOW" ? 0.7 : 1.0
+    maxHeight = atr * 2 * volMult
+    longHeight = maxHeight * (longPct / 100)
+    shortHeight = maxHeight * (shortPct / 100)
+    wickLen = avgBody * 0.4
+    
+    longProjBody := box.new(bar_index + 3, close + longHeight, bar_index + 4, close, bgcolor=colLong, border_color=colLong, border_width=1)
+    longProjWickUp := line.new(bar_index + 3, close + longHeight, bar_index + 3, close + longHeight + wickLen, color=colLong, width=2)
+    longProjWickDown := line.new(bar_index + 3, close, bar_index + 3, close - wickLen, color=colLong, width=2)
+    longLabelText = longPerfect ? "🎯 " + str.tostring(longPct) + "%" : str.tostring(longPct) + "%"
+    longProjLabel := label.new(bar_index + 3, close + longHeight + wickLen + atr * 0.15, longLabelText, style=label.style_label_down, color=colLong, textcolor=colText, size=size.normal)
+    
+    shortProjBody := box.new(bar_index + 5, close, bar_index + 6, close - shortHeight, bgcolor=colShort, border_color=colShort, border_width=1)
+    shortProjWickUp := line.new(bar_index + 5, close, bar_index + 5, close + wickLen, color=colShort, width=2)
+    shortProjWickDown := line.new(bar_index + 5, close - shortHeight, bar_index + 5, close - shortHeight - wickLen, color=colShort, width=2)
+    shortLabelText = shortPerfect ? "🎯 " + str.tostring(shortPct) + "%" : str.tostring(shortPct) + "%"
+    shortProjLabel := label.new(bar_index + 5, close - shortHeight - wickLen - atr * 0.15, shortLabelText, style=label.style_label_up, color=colShort, textcolor=colText, size=size.normal)
+
+// ============================================================================
+// BUY / SELL SIGNALS (Directional Pressure Confirmation)
+// ============================================================================
+
+bullSignal = ta.crossover(ema8, ema21) and isUptrend and deltaBullish
+bearSignal = ta.crossunder(ema8, ema21) and isDowntrend and deltaBearish
+
+plotshape(bullSignal, "BUY Signal", shape.labelup, location.belowbar, colLong, text="BUY", textcolor=color.white, size=size.small)
+plotshape(bearSignal, "SELL Signal", shape.labeldown, location.abovebar, colShort, text="SELL", textcolor=color.white, size=size.small)
+
+plotshape(longPerfect and not longPerfect[1], "LONG Strong Setup", shape.diamond, location.belowbar, colYellow, size=size.tiny)
+plotshape(shortPerfect and not shortPerfect[1], "SHORT Strong Setup", shape.diamond, location.abovebar, colYellow, size=size.tiny)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(longPerfect and not longPerfect[1], "LONG Strong Setup", "LONG Strong Setup - Directional Conditions Aligned")
+alertcondition(shortPerfect and not shortPerfect[1], "SHORT Strong Setup", "SHORT Strong Setup - Directional Conditions Aligned")
+alertcondition(bullSignal, "BUY Signal", "BUY Signal - EMA Cross and Directional Pressure Aligned")
+alertcondition(bearSignal, "SELL Signal", "SELL Signal - EMA Cross and Directional Pressure Aligned")
+alertcondition(trendChanged, "Trend Change", "🔄 Trend Direction Changed")
